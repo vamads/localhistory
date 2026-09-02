@@ -1,0 +1,22 @@
+# Local environments and OS files
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# Downloaded Wikipedia/Wikidata dumps and generated indexes
+data/
+*.parquet
+*.parquet/
+*.sql.gz
+*.xml
+*.xml.bz2
+*_checkpoint.json
+categories_by_hop.json
+categories_by_hop.txt
+
+# Local configuration and logs
+.env
+.env.*
+*.log

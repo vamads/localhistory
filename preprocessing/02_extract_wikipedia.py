@@ -1,5 +1,5 @@
 """
-wikipedia_pipeline.py
+02_extract_wikipedia.py
 
 Production PySpark job that processes the full English Wikipedia XML dump
 and outputs two clean Parquet files for the HistoryGraph project.
@@ -19,7 +19,7 @@ Runtime: ~2-4 hours on M1 Pro with 10 cores
 Outputs: ~15-30GB total Parquet
 
 Usage:
-    python wikipedia_pipeline.py
+    python 02_extract_wikipedia.py
 
 Make sure to close Chrome and other heavy apps before running.
 """
@@ -46,6 +46,7 @@ def resolve_data_dir() -> Path:
 
     candidates = [
         Path(__file__).resolve().parent.parent / "data",
+        Path(__file__).resolve().parent.parent.parent / "data",
         Path(__file__).resolve().parent / "data",
     ]
     return next((path for path in candidates if path.exists()), candidates[0])

@@ -1,5 +1,5 @@
 """
-local_history_search_v2.py
+search.py
 
 Hybrid local history search combining:
   1. Coordinate proximity   — articles within radius_km of user location
@@ -7,7 +7,7 @@ Hybrid local history search combining:
   3. Scoring & ranking      — relevance, entity class, hop, date
 
 Usage:
-    python local_history_search_v2.py
+    python search.py
 """
 
 import re

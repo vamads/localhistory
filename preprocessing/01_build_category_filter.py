@@ -1,5 +1,5 @@
 """
-bfs_from_dumps.py
+01_build_category_filter.py
 
 Builds a Wikipedia category graph from three SQL dumps and BFS from a seed.
 Also saves article→category membership for use in the production pipeline.
@@ -42,6 +42,7 @@ def resolve_data_dir() -> Path:
 
     candidates = [
         Path(__file__).resolve().parent.parent / "data",
+        Path(__file__).resolve().parent.parent.parent / "data",
         Path(__file__).resolve().parent / "data",
     ]
     return next((path for path in candidates if path.exists()), candidates[0])

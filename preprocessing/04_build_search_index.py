@@ -1,5 +1,5 @@
 """
-build_local_history_index.py
+04_build_search_index.py
 
 Joins articles + Wikidata metadata + category info into a single
 local_history_index.parquet ready for the local history demo.
@@ -33,6 +33,7 @@ def resolve_data_dir() -> Path:
 
     candidates = [
         Path(__file__).resolve().parent.parent / "data",
+        Path(__file__).resolve().parent.parent.parent / "data",
         Path(__file__).resolve().parent / "data",
     ]
     return next((path for path in candidates if path.exists()), candidates[0])

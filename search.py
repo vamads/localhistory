@@ -3,21 +3,22 @@ search.py
 
 Hybrid local history search combining:
   1. Coordinate proximity   — articles within radius_km of user location
-  2. Text match             — articles mentioning location in first_paragraph
-  3. Scoring & ranking      — relevance, entity class, hop, date
+  2. BM25 retrieval          — fallback for articles without coordinates
+  3. Scoring & ranking      — BM25, distance, entity class, hop, date
 
 Usage:
     python search.py
 """
 
-import re
 import ast
+import json
 import math
 import os
 import pandas as pd
 import numpy as np
 from pathlib import Path
 from collections import defaultdict
+import bm25s
 
 def resolve_data_dir() -> Path:
     """Return the data directory, allowing local or deployed configuration."""
@@ -34,6 +35,8 @@ def resolve_data_dir() -> Path:
 
 DATA_DIR = resolve_data_dir()
 INDEX_PATH = DATA_DIR / "local_history_index.parquet"
+BM25_INDEX_PATH = DATA_DIR / "bm25_index"
+BM25_DOC_IDS_PATH = DATA_DIR / "bm25_doc_ids.json"
 
 # ── Entity type sets ──────────────────────────────────────────────────────────
 
@@ -330,21 +333,16 @@ def haversine_km(lat1, lon1, lat2, lon2) -> float:
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
-def text_score(title: str, first_para: str, location_re) -> int:
-    score = 0
-    first_para = first_para or ""
-    if location_re.search(title or ""):
-        score += 3
-    first_sentence = first_para.split(".")[0] if "." in first_para else first_para[:200]
-    if location_re.search(first_sentence):
-        score += 10
-    mentions = location_re.findall(first_para)
-    if mentions:
-        score += 5
-        score += min(len(mentions) - 1, 3)
-    if len(first_para) < 100:
-        score -= 2
-    return score
+def load_bm25_index():
+    """Load the persisted BM25 index and its page-id mapping."""
+    retriever = bm25s.BM25.load(
+        BM25_INDEX_PATH,
+        load_corpus=False,
+        mmap=True,
+    )
+    with BM25_DOC_IDS_PATH.open() as f:
+        page_ids = json.load(f)
+    return retriever, page_ids
 
 
 # ── Main search ───────────────────────────────────────────────────────────────
@@ -370,7 +368,21 @@ def search_local_history(
         axis=1,
     )
 
-    location_re = re.compile(rf"\b{re.escape(location_name)}\b", re.IGNORECASE)
+    bm25_retriever, bm25_page_ids = load_bm25_index()
+    query_tokens = bm25s.tokenize([location_name])
+    bm25_docs, bm25_scores = bm25_retriever.retrieve(
+        query_tokens,
+        k=len(bm25_page_ids),
+    )
+
+    # Give every article a score. Articles outside the BM25 index receive 0.
+    score_by_page_id = dict.fromkeys(bm25_page_ids, 0.0)
+    for doc_id, score in zip(
+        np.asarray(bm25_docs).ravel(),
+        np.asarray(bm25_scores).ravel(),
+    ):
+        score_by_page_id[bm25_page_ids[int(doc_id)]] = float(score)
+    df["bm25_score"] = df["page_id"].map(score_by_page_id).fillna(0.0)
 
     # Layer 1: coordinate proximity
     geo = df.dropna(subset=["lat", "lon"]).copy()
@@ -379,29 +391,26 @@ def search_local_history(
     )
     nearby = geo[geo["distance_km"] <= radius_km].copy()
     nearby["source"] = "coordinates"
-    nearby["text_score_val"] = nearby.apply(
-        lambda r: text_score(r["title"], r["first_paragraph"], location_re), axis=1
-    )
 
-    # Layer 2: text match
-    text_mask = df["first_paragraph"].str.contains(location_re, na=False)
-    text_matches = df[text_mask].copy()
-    text_matches["distance_km"] = None
-    text_matches["source"] = "text"
-    text_matches["text_score_val"] = text_matches.apply(
-        lambda r: text_score(r["title"], r["first_paragraph"], location_re), axis=1
-    )
-    text_matches = text_matches[text_matches["text_score_val"] >= 10]
+    # Layer 2: BM25 fallback for articles without coordinate candidates.
+    nearby_ids = set(nearby["page_id"])
+    bm25_matches = df[
+        (df["bm25_score"] > 0)
+        & ~df["page_id"].isin(nearby_ids)
+        & df["lat"].isna()
+    ].copy()
+    bm25_matches["distance_km"] = np.nan
+    bm25_matches["source"] = "bm25"
 
-    # Combine — prefer coordinate row if duplicate
-    combined = pd.concat([nearby, text_matches]).drop_duplicates(
+    # Coordinate candidates take precedence; BM25 supplies the missing ones.
+    combined = pd.concat([nearby, bm25_matches]).drop_duplicates(
         subset="page_id", keep="first"
     )
 
     # Composite score
     def composite_score(row):
         s = 0.0
-        s += row.get("text_score_val", 0) * 2
+        s += row.get("bm25_score", 0)
         dist = row.get("distance_km")
         if pd.notna(dist) and dist is not None:
             s += max(0, 20 - dist * 0.4)
@@ -423,7 +432,13 @@ def search_local_history(
         return s
 
     combined["score"] = combined.apply(composite_score, axis=1)
-    results = combined.sort_values("score", ascending=False).head(top_n)
+    combined["coordinate_priority"] = (
+        combined["source"] == "coordinates"
+    ).astype(int)
+    results = combined.sort_values(
+        ["coordinate_priority", "score"],
+        ascending=[False, False],
+    ).head(top_n)
 
     # Timeline
     def century_label(year):
@@ -466,7 +481,7 @@ def search_local_history(
         "stats": {
             "total_found": len(combined),
             "from_coords": (combined["source"] == "coordinates").sum(),
-            "from_text": (combined["source"] == "text").sum(),
+            "from_bm25": (combined["source"] == "bm25").sum(),
             "with_dates": results["year"].notna().sum(),
         },
     }
@@ -485,7 +500,7 @@ def print_results(output: dict, location_name: str):
     print(
         f"Found {stats['total_found']} articles "
         f"({stats['from_coords']} by coordinates, "
-        f"{stats['from_text']} by text match)"
+        f"{stats['from_bm25']} by BM25 fallback)"
     )
     print(f"{stats['with_dates']} have dates for timeline\n")
 
@@ -494,7 +509,7 @@ def print_results(output: dict, location_name: str):
         dist = (
             f"{row['distance_km']:.1f}km"
             if pd.notna(row.get("distance_km"))
-            else "text match"
+            else "BM25 match"
         )
         year = f" [{int(row['year'])}]" if pd.notna(row.get("year")) else ""
         print(

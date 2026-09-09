@@ -3,3 +3,4 @@ numpy
 pyarrow
 requests
 pyspark
+bm25s

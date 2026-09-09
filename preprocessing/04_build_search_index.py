@@ -20,10 +20,13 @@ One row per article. Columns:
 
 import re
 import ast
+import json
 import os
 import pandas as pd
 import numpy as np
+import bm25s
 from pathlib import Path
+
 
 def resolve_data_dir() -> Path:
     """Return the data directory, allowing local or deployed configuration."""
@@ -41,6 +44,21 @@ def resolve_data_dir() -> Path:
 
 DATA_DIR = resolve_data_dir()
 
+
+def assert_unique_page_ids(df: pd.DataFrame, name: str) -> None:
+    """Fail clearly if an input contains more than one row per article."""
+    duplicate_rows = df[df["page_id"].duplicated(keep=False)]
+    if not duplicate_rows.empty:
+        duplicate_ids = duplicate_rows["page_id"].drop_duplicates().head(10).tolist()
+        raise ValueError(
+            f"{name} contains duplicate page_id values. "
+            f"Found {duplicate_rows['page_id'].nunique():,} duplicate IDs; "
+            f"sample: {duplicate_ids}"
+        )
+
+    print(f"  {name}: {len(df):,} rows, {df['page_id'].nunique():,} unique page_ids")
+
+
 print("Loading files ...")
 
 articles = pd.read_parquet(
@@ -55,6 +73,7 @@ articles = pd.read_parquet(
     ],
 )
 print(f"  Articles:    {len(articles):,}")
+assert_unique_page_ids(articles, "Articles")
 
 wikidata = pd.read_parquet(
     DATA_DIR / "wikidata_metadata.parquet",
@@ -77,8 +96,11 @@ wikidata = pd.read_parquet(
     ],
 )
 print(f"  Wikidata:    {len(wikidata):,}")
+assert_unique_page_ids(wikidata, "Wikidata")
 
-cats = pd.read_parquet(DATA_DIR / "article_categories.parquet", columns=["page_id", "hop"])
+cats = pd.read_parquet(
+    DATA_DIR / "article_categories.parquet", columns=["page_id", "hop"]
+)
 # Keep minimum hop per article — closest to History root
 min_hop = cats.groupby("page_id")["hop"].min().reset_index()
 min_hop.columns = ["page_id", "hop"]
@@ -90,6 +112,7 @@ print("\nJoining ...")
 df = articles.merge(wikidata, on="page_id", how="left")
 df = df.merge(min_hop, on="page_id", how="left")
 print(f"  Combined:    {len(df):,} articles")
+assert_unique_page_ids(df, "Combined index")
 
 # ── Canonical date ────────────────────────────────────────────────────────────
 # Pick the best single date for timeline display, in priority order
@@ -132,6 +155,15 @@ def extract_year(date_str):
 
 
 df["year"] = df["canonical_date"].apply(extract_year)
+
+MIN_HISTORICAL_YEAR = -5000
+
+MAX_HISTORICAL_YEAR = 2025
+
+df = df[
+    df["year"].isna()
+    | (df["year"] >= MIN_HISTORICAL_YEAR) & (df["year"] <= MAX_HISTORICAL_YEAR)
+].copy()
 
 # ── Entity class ──────────────────────────────────────────────────────────────
 # Simplify instance_of list into one of 5 classes
@@ -293,5 +325,24 @@ print(f"  {df['year'].notna().sum():,} articles have a year for timeline")
 
 out = DATA_DIR / "local_history_index.parquet"
 df.to_parquet(out, index=False, compression="snappy")
+
+# Build BM25 once. Persist document order separately so search.py can map
+# BM25 document positions back to page_id values.
+bm25_df = df[~df["is_redirect"].fillna(False)].copy()
+bm25_corpus = bm25_df["full_text"].fillna("").tolist()
+bm25_tokens = bm25s.tokenize(bm25_corpus)
+bm25_retriever = bm25s.BM25()
+bm25_retriever.index(bm25_tokens)
+bm25_retriever.save(DATA_DIR / "bm25_index")
+(DATA_DIR / "bm25_doc_ids.json").write_text(
+    json.dumps(
+        [
+            int(page_id) if isinstance(page_id, np.integer) else page_id
+            for page_id in bm25_df["page_id"].tolist()
+        ]
+    )
+)
+
 print(f"\nSaved → {out}")
+print(f"Saved BM25 index → {DATA_DIR / 'bm25_index'}")
 print(f"Columns: {df.columns.tolist()}")

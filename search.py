@@ -14,10 +14,12 @@ import ast
 import json
 import math
 import os
+import re
 import pandas as pd
 import numpy as np
 from pathlib import Path
 from collections import defaultdict
+from functools import lru_cache
 import bm25s
 
 def resolve_data_dir() -> Path:
@@ -37,6 +39,8 @@ DATA_DIR = resolve_data_dir()
 INDEX_PATH = DATA_DIR / "local_history_index.parquet"
 BM25_INDEX_PATH = DATA_DIR / "bm25_index"
 BM25_DOC_IDS_PATH = DATA_DIR / "bm25_doc_ids.json"
+KALM_EMBEDDINGS_DIR = DATA_DIR / "kalm_first_paragraph_embeddings"
+KALM_MODEL_NAME = "KaLM-Embedding/KaLM-embedding-multilingual-mini-instruct-v2.5"
 
 # ── Entity type sets ──────────────────────────────────────────────────────────
 
@@ -345,6 +349,54 @@ def load_bm25_index():
     return retriever, page_ids
 
 
+@lru_cache(maxsize=1)
+def load_kalm_model():
+    """Load the same KaLM model used to create the stored embeddings."""
+    from sentence_transformers import SentenceTransformer
+
+    model = SentenceTransformer(
+        KALM_MODEL_NAME,
+        trust_remote_code=True,
+    )
+    model.max_seq_length = 4096
+    return model
+
+
+@lru_cache(maxsize=16)
+def kalm_scores(location_name: str) -> pd.Series:
+    """Return cosine similarity to each stored first-paragraph embedding."""
+    embedding_files = sorted(KALM_EMBEDDINGS_DIR.glob("embeddings_*.parquet"))
+    if not embedding_files:
+        return pd.Series(dtype="float32")
+
+    model = load_kalm_model()
+    query_embedding = model.encode(
+        [location_name],
+        normalize_embeddings=True,
+        show_progress_bar=False,
+    )[0].astype(np.float32)
+
+    score_by_page_id = {}
+    for path in embedding_files:
+        chunk = pd.read_parquet(path, columns=["page_id", "embedding"])
+        matrix = np.vstack(chunk["embedding"].to_numpy()).astype(np.float32)
+        scores = matrix @ query_embedding
+        score_by_page_id.update(
+            zip(chunk["page_id"].tolist(), scores.astype(float).tolist())
+        )
+
+    return pd.Series(score_by_page_id, dtype="float32")
+
+
+def normalize_scores(values: pd.Series) -> pd.Series:
+    """Min-max normalize one query's scores to [0, 1]."""
+    minimum = values.min()
+    maximum = values.max()
+    if pd.isna(minimum) or maximum <= minimum:
+        return pd.Series(0.0, index=values.index)
+    return (values - minimum) / (maximum - minimum)
+
+
 # ── Main search ───────────────────────────────────────────────────────────────
 
 
@@ -354,6 +406,8 @@ def search_local_history(
     user_lon: float,
     radius_km: float = 50.0,
     top_n: int = 30,
+    bm25_min_score: float = 1.0,
+    kalm_top_k: int = 200,
     index: pd.DataFrame = None,
 ) -> dict:
     if index is None:
@@ -384,6 +438,29 @@ def search_local_history(
         score_by_page_id[bm25_page_ids[int(doc_id)]] = float(score)
     df["bm25_score"] = df["page_id"].map(score_by_page_id).fillna(0.0)
 
+    # Exact phrase evidence. Full-text matches are scored but do not create
+    # candidates by themselves because inline references can match there.
+    location_pattern = re.compile(
+        rf"(?<!\w){re.escape(location_name)}(?!\w)",
+        re.IGNORECASE,
+    )
+    df["exact_title_match"] = df["title"].fillna("").str.contains(
+        location_pattern, na=False
+    )
+    df["exact_full_text_match"] = df["full_text"].fillna("").str.contains(
+        location_pattern, na=False
+    )
+    df["exact_score"] = (
+        10 * df["exact_title_match"].astype(float)
+        + 3 * df["exact_full_text_match"].astype(float)
+    )
+
+    # KaLM embeddings represent first paragraphs (see kalm_embeddings.py).
+    kalm_by_page_id = kalm_scores(location_name)
+    df["kalm_score"] = df["page_id"].map(kalm_by_page_id).fillna(0.0)
+    df["bm25_score_normalized"] = normalize_scores(df["bm25_score"])
+    df["kalm_score_normalized"] = normalize_scores(df["kalm_score"])
+
     # Layer 1: coordinate proximity
     geo = df.dropna(subset=["lat", "lon"]).copy()
     geo["distance_km"] = geo.apply(
@@ -395,22 +472,37 @@ def search_local_history(
     # Layer 2: BM25 fallback for articles without coordinate candidates.
     nearby_ids = set(nearby["page_id"])
     bm25_matches = df[
-        (df["bm25_score"] > 0)
+        (df["bm25_score"] >= bm25_min_score)
         & ~df["page_id"].isin(nearby_ids)
         & df["lat"].isna()
     ].copy()
     bm25_matches["distance_km"] = np.nan
     bm25_matches["source"] = "bm25"
 
+    # Add exact-title and semantic candidates that BM25 may miss.
+    ranked_kalm = df.nlargest(kalm_top_k, "kalm_score")
+    extra_matches = df[
+        (
+            df["exact_title_match"]
+            | df["page_id"].isin(ranked_kalm["page_id"])
+        )
+        & ~df["page_id"].isin(nearby_ids)
+        & df["lat"].isna()
+    ].copy()
+    extra_matches["distance_km"] = np.nan
+    extra_matches["source"] = "exact_or_kalm"
+
     # Coordinate candidates take precedence; BM25 supplies the missing ones.
-    combined = pd.concat([nearby, bm25_matches]).drop_duplicates(
+    combined = pd.concat([nearby, bm25_matches, extra_matches]).drop_duplicates(
         subset="page_id", keep="first"
     )
 
     # Composite score
     def composite_score(row):
         s = 0.0
-        s += row.get("bm25_score", 0)
+        s += row.get("exact_score", 0)
+        s += 5 * row.get("bm25_score_normalized", 0)
+        s += 2 * row.get("kalm_score_normalized", 0)
         dist = row.get("distance_km")
         if pd.notna(dist) and dist is not None:
             s += max(0, 20 - dist * 0.4)
@@ -482,6 +574,11 @@ def search_local_history(
             "total_found": len(combined),
             "from_coords": (combined["source"] == "coordinates").sum(),
             "from_bm25": (combined["source"] == "bm25").sum(),
+            "from_exact_or_kalm": (combined["source"] == "exact_or_kalm").sum(),
+            "bm25_min_score": bm25_min_score,
+            "bm25_matches_before_coordinate_filter": (
+                (df["bm25_score"] >= bm25_min_score) & df["lat"].isna()
+            ).sum(),
             "with_dates": results["year"].notna().sum(),
         },
     }
@@ -500,7 +597,12 @@ def print_results(output: dict, location_name: str):
     print(
         f"Found {stats['total_found']} articles "
         f"({stats['from_coords']} by coordinates, "
-        f"{stats['from_bm25']} by BM25 fallback)"
+        f"{stats['from_bm25']} by BM25 fallback, "
+        f"{stats['from_exact_or_kalm']} exact/KaLM fallback)"
+    )
+    print(
+        f"BM25 threshold: {stats['bm25_min_score']} "
+        f"({stats['bm25_matches_before_coordinate_filter']} no-coordinate matches)"
     )
     print(f"{stats['with_dates']} have dates for timeline\n")
 

@@ -4,3 +4,4 @@ pyarrow
 requests
 pyspark
 bm25s
+sentence-transformers

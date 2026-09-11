@@ -397,6 +397,42 @@ def normalize_scores(values: pd.Series) -> pd.Series:
     return (values - minimum) / (maximum - minimum)
 
 
+def city_core(location_name: str) -> str:
+    """Use the city portion before an optional state/country qualifier."""
+    return location_name.split(",", 1)[0].strip()
+
+
+CITATION_MARKERS = (
+    r"\b(?:press|publisher|publishing|university press|journal|"
+    r"vol\.?|volume|pp?\.?|pages|isbn|doi|retrieved|accessed)\b"
+)
+
+
+def citation_context_count(text: str, location_pattern) -> int:
+    """Count city mentions occurring in citation-like sentence contexts."""
+    if text is None or pd.isna(text):
+        text = ""
+    citation_count = 0
+    sentences = re.split(r"(?<=[.!?])\s+|\n+", str(text))
+
+    for sentence in sentences:
+        if not location_pattern.search(sentence):
+            continue
+
+        marker_count = len(re.findall(CITATION_MARKERS, sentence, re.IGNORECASE))
+        has_year = bool(re.search(r"\b(?:18|19|20)\d{2}\b", sentence))
+        has_bibliographic_shape = bool(
+            re.search(r":[^.!?]{0,120},\s*(?:18|19|20)\d{2}\b", sentence)
+        )
+
+        # Require multiple signals unless the sentence has the characteristic
+        # publisher/location/year shape, reducing false penalties in prose.
+        if (marker_count >= 2 and has_year) or has_bibliographic_shape:
+            citation_count += 1
+
+    return citation_count
+
+
 # ── Main search ───────────────────────────────────────────────────────────────
 
 
@@ -408,6 +444,7 @@ def search_local_history(
     top_n: int = 30,
     bm25_min_score: float = 1.0,
     kalm_top_k: int = 200,
+    worst_n: int = 10,
     index: pd.DataFrame = None,
 ) -> dict:
     if index is None:
@@ -438,10 +475,11 @@ def search_local_history(
         score_by_page_id[bm25_page_ids[int(doc_id)]] = float(score)
     df["bm25_score"] = df["page_id"].map(score_by_page_id).fillna(0.0)
 
-    # Exact phrase evidence. Full-text matches are scored but do not create
-    # candidates by themselves because inline references can match there.
+    # Exact phrase evidence. A qualifier such as ", MI" or ", Michigan" is
+    # ignored for matching, so both queries use the core phrase "Ann Arbor".
+    city_name = city_core(location_name)
     location_pattern = re.compile(
-        rf"(?<!\w){re.escape(location_name)}(?!\w)",
+        rf"(?<!\w){re.escape(city_name)}(?!\w)",
         re.IGNORECASE,
     )
     df["exact_title_match"] = df["title"].fillna("").str.contains(
@@ -453,6 +491,9 @@ def search_local_history(
     df["exact_score"] = (
         10 * df["exact_title_match"].astype(float)
         + 3 * df["exact_full_text_match"].astype(float)
+    )
+    df["citation_context_count"] = df["full_text"].apply(
+        lambda text: citation_context_count(text, location_pattern)
     )
 
     # KaLM embeddings represent first paragraphs (see kalm_embeddings.py).
@@ -470,9 +511,12 @@ def search_local_history(
     nearby["source"] = "coordinates"
 
     # Layer 2: BM25 fallback for articles without coordinate candidates.
+    # BM25 scores individual terms, so require the complete city phrase here.
     nearby_ids = set(nearby["page_id"])
+    exact_city_match = df["exact_title_match"] | df["exact_full_text_match"]
     bm25_matches = df[
         (df["bm25_score"] >= bm25_min_score)
+        & exact_city_match
         & ~df["page_id"].isin(nearby_ids)
         & df["lat"].isna()
     ].copy()
@@ -480,7 +524,7 @@ def search_local_history(
     bm25_matches["source"] = "bm25"
 
     # Add exact-title and semantic candidates that BM25 may miss.
-    ranked_kalm = df.nlargest(kalm_top_k, "kalm_score")
+    ranked_kalm = df[exact_city_match].nlargest(kalm_top_k, "kalm_score")
     extra_matches = df[
         (
             df["exact_title_match"]
@@ -501,6 +545,7 @@ def search_local_history(
     def composite_score(row):
         s = 0.0
         s += row.get("exact_score", 0)
+        s -= 8 * row.get("citation_context_count", 0)
         s += 5 * row.get("bm25_score_normalized", 0)
         s += 2 * row.get("kalm_score_normalized", 0)
         dist = row.get("distance_km")
@@ -531,6 +576,7 @@ def search_local_history(
         ["coordinate_priority", "score"],
         ascending=[False, False],
     ).head(top_n)
+    worst_matches = combined.sort_values("score", ascending=True).head(worst_n)
 
     # Timeline
     def century_label(year):
@@ -567,6 +613,7 @@ def search_local_history(
 
     return {
         "results": results,
+        "worst_matches": worst_matches,
         "by_century": dict(by_century),
         "by_class": dict(by_class),
         "surprising": surprising,
@@ -575,9 +622,14 @@ def search_local_history(
             "from_coords": (combined["source"] == "coordinates").sum(),
             "from_bm25": (combined["source"] == "bm25").sum(),
             "from_exact_or_kalm": (combined["source"] == "exact_or_kalm").sum(),
+            "citation_context_matches": (
+                combined["citation_context_count"] > 0
+            ).sum(),
             "bm25_min_score": bm25_min_score,
             "bm25_matches_before_coordinate_filter": (
-                (df["bm25_score"] >= bm25_min_score) & df["lat"].isna()
+                (df["bm25_score"] >= bm25_min_score)
+                & exact_city_match
+                & df["lat"].isna()
             ).sum(),
             "with_dates": results["year"].notna().sum(),
         },
@@ -604,7 +656,22 @@ def print_results(output: dict, location_name: str):
         f"BM25 threshold: {stats['bm25_min_score']} "
         f"({stats['bm25_matches_before_coordinate_filter']} no-coordinate matches)"
     )
+    print(
+        f"Candidates with citation-like city context: "
+        f"{stats['citation_context_matches']}"
+    )
     print(f"{stats['with_dates']} have dates for timeline\n")
+
+    print("── Worst candidate matches ──────────────────────────────────")
+    for _, row in output["worst_matches"].iterrows():
+        print(
+            f"  [{row['source']:<14}] {row['title']} "
+            f"score={row['score']:.2f} "
+            f"(exact={row.get('exact_score', 0):.0f}, "
+            f"citation_penalty={8 * row.get('citation_context_count', 0):.0f}, "
+            f"bm25={row.get('bm25_score', 0):.2f}, "
+            f"kalm={row.get('kalm_score', 0):.3f})"
+        )
 
     print("── Top results ──────────────────────────────────────────────")
     for _, row in results.head(20).iterrows():

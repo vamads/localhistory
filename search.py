@@ -337,6 +337,7 @@ def haversine_km(lat1, lon1, lat2, lon2) -> float:
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
+@lru_cache(maxsize=1)
 def load_bm25_index():
     """Load the persisted BM25 index and its page-id mapping."""
     retriever = bm25s.BM25.load(
@@ -363,12 +364,13 @@ def load_kalm_model():
 
 
 @lru_cache(maxsize=16)
-def kalm_scores(location_name: str) -> pd.Series:
+def kalm_scores(location_name: str, target_page_ids=None) -> pd.Series:
     """Return cosine similarity to each stored first-paragraph embedding."""
     embedding_files = sorted(KALM_EMBEDDINGS_DIR.glob("embeddings_*.parquet"))
     if not embedding_files:
         return pd.Series(dtype="float32")
 
+    target_ids = set(target_page_ids) if target_page_ids is not None else None
     model = load_kalm_model()
     query_embedding = model.encode(
         [location_name],
@@ -379,6 +381,10 @@ def kalm_scores(location_name: str) -> pd.Series:
     score_by_page_id = {}
     for path in embedding_files:
         chunk = pd.read_parquet(path, columns=["page_id", "embedding"])
+        if target_ids is not None:
+            chunk = chunk[chunk["page_id"].isin(target_ids)]
+            if chunk.empty:
+                continue
         matrix = np.vstack(chunk["embedding"].to_numpy()).astype(np.float32)
         scores = matrix @ query_embedding
         score_by_page_id.update(
@@ -445,6 +451,7 @@ def search_local_history(
     bm25_min_score: float = 1.0,
     kalm_top_k: int = 200,
     worst_n: int = 10,
+    fallback_top_n: int = 15,
     index: pd.DataFrame = None,
 ) -> dict:
     if index is None:
@@ -461,18 +468,18 @@ def search_local_history(
 
     bm25_retriever, bm25_page_ids = load_bm25_index()
     query_tokens = bm25s.tokenize([location_name])
-    bm25_docs, bm25_scores = bm25_retriever.retrieve(
-        query_tokens,
-        k=len(bm25_page_ids),
+    query_terms = list(query_tokens.vocab.keys())
+    bm25_scores = (
+        bm25_retriever.get_scores(query_terms)
+        if query_terms
+        else np.zeros(len(bm25_page_ids), dtype=np.float32)
     )
 
-    # Give every article a score. Articles outside the BM25 index receive 0.
-    score_by_page_id = dict.fromkeys(bm25_page_ids, 0.0)
-    for doc_id, score in zip(
-        np.asarray(bm25_docs).ravel(),
-        np.asarray(bm25_scores).ravel(),
-    ):
-        score_by_page_id[bm25_page_ids[int(doc_id)]] = float(score)
+    # Compute corpus-level BM25 scores without sorting every document. We
+    # later retain these scores only for exact city-phrase candidates.
+    score_by_page_id = dict(
+        zip(bm25_page_ids, np.asarray(bm25_scores).astype(float))
+    )
     df["bm25_score"] = df["page_id"].map(score_by_page_id).fillna(0.0)
 
     # Exact phrase evidence. A qualifier such as ", MI" or ", Michigan" is
@@ -492,12 +499,28 @@ def search_local_history(
         10 * df["exact_title_match"].astype(float)
         + 3 * df["exact_full_text_match"].astype(float)
     )
-    df["citation_context_count"] = df["full_text"].apply(
-        lambda text: citation_context_count(text, location_pattern)
+    df["lead_exact_match"] = df["first_paragraph"].fillna("").str.contains(
+        location_pattern, na=False
+    )
+    exact_city_match = df["exact_title_match"] | df["exact_full_text_match"]
+    df["citation_context_count"] = 0
+    df.loc[exact_city_match, "citation_context_count"] = df.loc[
+        exact_city_match, "full_text"
+    ].apply(lambda text: citation_context_count(text, location_pattern))
+    # Citation context is a weak negative signal, not a per-reference
+    # subtraction. Strong title/lead evidence means the article is topical,
+    # even if it contains many ordinary bibliographic references.
+    df["citation_penalty"] = np.where(
+        df["exact_title_match"] | df["lead_exact_match"],
+        0.0,
+        np.minimum(8.0, 4.0 * df["citation_context_count"]),
     )
 
     # KaLM embeddings represent first paragraphs (see kalm_embeddings.py).
-    kalm_by_page_id = kalm_scores(location_name)
+    kalm_by_page_id = kalm_scores(
+        location_name,
+        tuple(df.loc[exact_city_match, "page_id"].tolist()),
+    )
     df["kalm_score"] = df["page_id"].map(kalm_by_page_id).fillna(0.0)
     df["bm25_score_normalized"] = normalize_scores(df["bm25_score"])
     df["kalm_score_normalized"] = normalize_scores(df["kalm_score"])
@@ -545,7 +568,7 @@ def search_local_history(
     def composite_score(row):
         s = 0.0
         s += row.get("exact_score", 0)
-        s -= 8 * row.get("citation_context_count", 0)
+        s -= row.get("citation_penalty", 0)
         s += 5 * row.get("bm25_score_normalized", 0)
         s += 2 * row.get("kalm_score_normalized", 0)
         dist = row.get("distance_km")
@@ -577,6 +600,11 @@ def search_local_history(
         ascending=[False, False],
     ).head(top_n)
     worst_matches = combined.sort_values("score", ascending=True).head(worst_n)
+    fallback_matches = (
+        combined[combined["source"] != "coordinates"]
+        .sort_values("score", ascending=False)
+        .head(fallback_top_n)
+    )
 
     # Timeline
     def century_label(year):
@@ -614,6 +642,7 @@ def search_local_history(
     return {
         "results": results,
         "worst_matches": worst_matches,
+        "fallback_matches": fallback_matches,
         "by_century": dict(by_century),
         "by_class": dict(by_class),
         "surprising": surprising,
@@ -662,13 +691,24 @@ def print_results(output: dict, location_name: str):
     )
     print(f"{stats['with_dates']} have dates for timeline\n")
 
+    print("── Top BM25/KaLM fallback matches ──────────────────────────")
+    for _, row in output["fallback_matches"].iterrows():
+        print(
+            f"  [{row['source']:<14}] {row['title']} "
+            f"score={row['score']:.2f} "
+            f"(exact={row.get('exact_score', 0):.0f}, "
+            f"citation_penalty={row.get('citation_penalty', 0):.0f}, "
+            f"bm25={row.get('bm25_score', 0):.2f}, "
+            f"kalm={row.get('kalm_score', 0):.3f})"
+        )
+
     print("── Worst candidate matches ──────────────────────────────────")
     for _, row in output["worst_matches"].iterrows():
         print(
             f"  [{row['source']:<14}] {row['title']} "
             f"score={row['score']:.2f} "
             f"(exact={row.get('exact_score', 0):.0f}, "
-            f"citation_penalty={8 * row.get('citation_context_count', 0):.0f}, "
+            f"citation_penalty={row.get('citation_penalty', 0):.0f}, "
             f"bm25={row.get('bm25_score', 0):.2f}, "
             f"kalm={row.get('kalm_score', 0):.3f})"
         )

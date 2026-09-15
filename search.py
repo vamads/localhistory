@@ -21,6 +21,7 @@ from pathlib import Path
 from collections import defaultdict
 from functools import lru_cache
 import bm25s
+import torch
 
 def resolve_data_dir() -> Path:
     """Return the data directory, allowing local or deployed configuration."""
@@ -41,6 +42,18 @@ BM25_INDEX_PATH = DATA_DIR / "bm25_index"
 BM25_DOC_IDS_PATH = DATA_DIR / "bm25_doc_ids.json"
 KALM_EMBEDDINGS_DIR = DATA_DIR / "kalm_first_paragraph_embeddings"
 KALM_MODEL_NAME = "KaLM-Embedding/KaLM-embedding-multilingual-mini-instruct-v2.5"
+
+
+def kalm_device() -> str:
+    """Select the fastest available PyTorch device for embedding searches."""
+    configured = os.getenv("LOCAL_HISTORY_EMBEDDING_DEVICE")
+    if configured:
+        return configured
+    if torch.cuda.is_available():
+        return "cuda"
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
 
 # ── Entity type sets ──────────────────────────────────────────────────────────
 
@@ -358,40 +371,66 @@ def load_kalm_model():
     model = SentenceTransformer(
         KALM_MODEL_NAME,
         trust_remote_code=True,
+        device=kalm_device(),
     )
     model.max_seq_length = 4096
     return model
 
 
+@lru_cache(maxsize=1)
+def load_kalm_embeddings():
+    """Load every stored embedding once and keep the matrix on the search device."""
+    embedding_files = sorted(KALM_EMBEDDINGS_DIR.glob("embeddings_*.parquet"))
+    if not embedding_files:
+        return torch.empty((0, 0), device=kalm_device()), {}
+
+    chunks = [pd.read_parquet(path, columns=["page_id", "embedding"])
+              for path in embedding_files]
+    embeddings = pd.concat(chunks, ignore_index=True)
+    matrix = np.vstack(embeddings["embedding"].to_numpy()).astype(np.float32)
+    page_ids = embeddings["page_id"].tolist()
+    page_to_row = {page_id: row for row, page_id in enumerate(page_ids)}
+    return torch.from_numpy(matrix).to(kalm_device()), page_to_row
+
+
 @lru_cache(maxsize=16)
 def kalm_scores(location_name: str, target_page_ids=None) -> pd.Series:
     """Return cosine similarity to each stored first-paragraph embedding."""
-    embedding_files = sorted(KALM_EMBEDDINGS_DIR.glob("embeddings_*.parquet"))
-    if not embedding_files:
+    embedding_matrix, page_to_row = load_kalm_embeddings()
+    if not page_to_row:
         return pd.Series(dtype="float32")
 
-    target_ids = set(target_page_ids) if target_page_ids is not None else None
     model = load_kalm_model()
     query_embedding = model.encode(
         [location_name],
         normalize_embeddings=True,
         show_progress_bar=False,
     )[0].astype(np.float32)
+    query = torch.from_numpy(query_embedding).to(embedding_matrix.device)
 
-    score_by_page_id = {}
-    for path in embedding_files:
-        chunk = pd.read_parquet(path, columns=["page_id", "embedding"])
-        if target_ids is not None:
-            chunk = chunk[chunk["page_id"].isin(target_ids)]
-            if chunk.empty:
-                continue
-        matrix = np.vstack(chunk["embedding"].to_numpy()).astype(np.float32)
-        scores = matrix @ query_embedding
-        score_by_page_id.update(
-            zip(chunk["page_id"].tolist(), scores.astype(float).tolist())
-        )
+    if target_page_ids is None:
+        rows = list(range(len(page_to_row)))
+        selected_page_ids = list(page_to_row)
+    else:
+        selected_page_ids = [page_id for page_id in target_page_ids if page_id in page_to_row]
+        rows = [page_to_row[page_id] for page_id in selected_page_ids]
+    if not rows:
+        return pd.Series(dtype="float32")
 
-    return pd.Series(score_by_page_id, dtype="float32")
+    # Do one large matrix-vector multiplication on the resident device, then
+    # keep only the candidate IDs used by the ranking pipeline.
+    all_scores = (embedding_matrix @ query).detach().cpu().numpy()
+    selected_scores = all_scores[rows]
+    return pd.Series(
+        dict(zip(selected_page_ids, selected_scores.astype(float))),
+        dtype="float32",
+    )
+
+
+@lru_cache(maxsize=1)
+def load_coordinate_index() -> pd.DataFrame:
+    """Load coordinate columns once for vectorized radius filtering."""
+    return pd.read_parquet(INDEX_PATH, columns=["page_id", "lat", "lon"])
 
 
 def normalize_scores(values: pd.Series) -> pd.Series:
@@ -525,12 +564,25 @@ def search_local_history(
     df["bm25_score_normalized"] = normalize_scores(df["bm25_score"])
     df["kalm_score_normalized"] = normalize_scores(df["kalm_score"])
 
-    # Layer 1: coordinate proximity
-    geo = df.dropna(subset=["lat", "lon"]).copy()
-    geo["distance_km"] = geo.apply(
-        lambda r: haversine_km(user_lat, user_lon, r["lat"], r["lon"]), axis=1
+    # Layer 1: coordinate proximity. Coordinates are loaded once and the
+    # distance calculation is vectorized instead of calling Python per row.
+    coords = load_coordinate_index().dropna(subset=["lat", "lon"])
+    lat1 = math.radians(user_lat)
+    lat2 = np.radians(coords["lat"].to_numpy(dtype=np.float64))
+    dlat = lat2 - lat1
+    dlambda = np.radians(coords["lon"].to_numpy(dtype=np.float64) - user_lon)
+    a = (
+        np.sin(dlat / 2) ** 2
+        + math.cos(lat1) * np.cos(lat2) * np.sin(dlambda / 2) ** 2
     )
-    nearby = geo[geo["distance_km"] <= radius_km].copy()
+    distances = 6371.0 * 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+    distance_by_page_id = pd.Series(
+        distances,
+        index=coords["page_id"].to_numpy(),
+        dtype="float64",
+    )
+    df["distance_km"] = df["page_id"].map(distance_by_page_id)
+    nearby = df[df["distance_km"].notna() & (df["distance_km"] <= radius_km)].copy()
     nearby["source"] = "coordinates"
 
     # Layer 2: BM25 fallback for articles without coordinate candidates.

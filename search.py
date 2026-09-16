@@ -17,6 +17,7 @@ import os
 import re
 import pandas as pd
 import numpy as np
+import duckdb
 from pathlib import Path
 from collections import defaultdict
 from functools import lru_cache
@@ -42,6 +43,26 @@ BM25_INDEX_PATH = DATA_DIR / "bm25_index"
 BM25_DOC_IDS_PATH = DATA_DIR / "bm25_doc_ids.json"
 KALM_EMBEDDINGS_DIR = DATA_DIR / "kalm_first_paragraph_embeddings"
 KALM_MODEL_NAME = "KaLM-Embedding/KaLM-embedding-multilingual-mini-instruct-v2.5"
+
+
+def load_candidate_index(location_name: str) -> pd.DataFrame:
+    """Load only articles containing the queried city in searchable text."""
+    city_name = location_name.split(",", 1)[0].strip().lower()
+    query = """
+        SELECT *
+        FROM read_parquet(?)
+        WHERE NOT is_redirect
+          AND (
+              contains(lower(coalesce(title, '')), ?)
+              OR contains(lower(coalesce(first_paragraph, '')), ?)
+              OR contains(lower(coalesce(full_text, '')), ?)
+          )
+    """
+    with duckdb.connect() as connection:
+        return connection.execute(
+            query,
+            [str(INDEX_PATH), city_name, city_name, city_name],
+        ).fetchdf()
 
 
 def kalm_device() -> str:
@@ -417,10 +438,10 @@ def kalm_scores(location_name: str, target_page_ids=None) -> pd.Series:
     if not rows:
         return pd.Series(dtype="float32")
 
-    # Do one large matrix-vector multiplication on the resident device, then
-    # keep only the candidate IDs used by the ranking pipeline.
-    all_scores = (embedding_matrix @ query).detach().cpu().numpy()
-    selected_scores = all_scores[rows]
+    # Score only the candidate rows. The previous implementation multiplied
+    # the query by the entire embedding matrix before discarding almost all
+    # scores, which is particularly expensive on MPS for a large corpus.
+    selected_scores = (embedding_matrix[rows] @ query).detach().cpu().numpy()
     return pd.Series(
         dict(zip(selected_page_ids, selected_scores.astype(float))),
         dtype="float32",
@@ -494,16 +515,20 @@ def search_local_history(
     index: pd.DataFrame = None,
 ) -> dict:
     if index is None:
-        index = pd.read_parquet(INDEX_PATH)
+        index = load_candidate_index(location_name)
 
     df = index[~index["is_redirect"]].copy()
 
-    # Re-apply entity classification with updated type sets
-    # (overrides whatever was saved in the index)
-    df["entity_class"] = df.apply(
-        lambda r: get_entity_class(r["instance_of"], r["title"], r["first_paragraph"]),
-        axis=1,
-    )
+    # Reuse the precomputed classification. Reclassifying every article on
+    # every query is an expensive full-corpus row-wise operation. Older
+    # indexes without this column still get the previous fallback behavior.
+    if "entity_class" not in df.columns:
+        df["entity_class"] = df.apply(
+            lambda r: get_entity_class(
+                r["instance_of"], r["title"], r["first_paragraph"]
+            ),
+            axis=1,
+        )
 
     bm25_retriever, bm25_page_ids = load_bm25_index()
     query_tokens = bm25s.tokenize([location_name])
@@ -531,9 +556,18 @@ def search_local_history(
     df["exact_title_match"] = df["title"].fillna("").str.contains(
         location_pattern, na=False
     )
-    df["exact_full_text_match"] = df["full_text"].fillna("").str.contains(
-        location_pattern, na=False
+    full_text = df["full_text"].fillna("")
+    # The city name is a literal string, so avoid running the regex engine over
+    # every long article. Recheck only literal matches with the boundary-aware
+    # regex to preserve the original matching semantics.
+    literal_full_text_match = full_text.str.contains(
+        city_name, case=False, regex=False, na=False
     )
+    df["exact_full_text_match"] = False
+    literal_matches = literal_full_text_match[literal_full_text_match].index
+    df.loc[literal_matches, "exact_full_text_match"] = full_text.loc[
+        literal_matches
+    ].map(lambda text: bool(location_pattern.search(text)))
     df["exact_score"] = (
         10 * df["exact_title_match"].astype(float)
         + 3 * df["exact_full_text_match"].astype(float)
@@ -564,9 +598,9 @@ def search_local_history(
     df["bm25_score_normalized"] = normalize_scores(df["bm25_score"])
     df["kalm_score_normalized"] = normalize_scores(df["kalm_score"])
 
-    # Layer 1: coordinate proximity. Coordinates are loaded once and the
-    # distance calculation is vectorized instead of calling Python per row.
-    coords = load_coordinate_index().dropna(subset=["lat", "lon"])
+    # Layer 1: coordinate proximity. The candidate index already contains
+    # coordinates, so do not reload the full coordinate corpus.
+    coords = df[["page_id", "lat", "lon"]].dropna(subset=["lat", "lon"])
     lat1 = math.radians(user_lat)
     lat2 = np.radians(coords["lat"].to_numpy(dtype=np.float64))
     dlat = lat2 - lat1
@@ -796,7 +830,7 @@ def print_results(output: dict, location_name: str):
 
 if __name__ == "__main__":
     print("Loading index ...")
-    index = pd.read_parquet(INDEX_PATH)
+    index = load_candidate_index("Ann Arbor")
     print(f"  {len(index):,} articles loaded")
 
     for location, lat, lon in [

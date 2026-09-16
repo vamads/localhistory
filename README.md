@@ -34,3 +34,17 @@ python preprocessing/04_build_search_index.py
 ```
 
 The final script writes `local_history_index.parquet`, which `search.py` reads.
+
+## Profile search performance
+
+Run the profiler with fixed coordinates to measure cold-start and warm-search
+latency without including geocoding network time:
+
+```bash
+python profile_search.py
+python profile_search.py --query Detroit --lat 42.3314 --lon -83.0458 --repeats 5
+```
+
+The report includes cProfile hotspots, Python allocation peaks, process RSS,
+PyTorch device memory, and cache hit/miss counts. Use `--profile-output
+search.prof` to save a cProfile file for later inspection.

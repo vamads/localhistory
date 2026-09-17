@@ -45,6 +45,7 @@ KALM_EMBEDDINGS_DIR = DATA_DIR / "kalm_first_paragraph_embeddings"
 KALM_MODEL_NAME = "KaLM-Embedding/KaLM-embedding-multilingual-mini-instruct-v2.5"
 
 
+@lru_cache(maxsize=16)
 def load_candidate_index(location_name: str) -> pd.DataFrame:
     """Load only articles containing the queried city in searchable text."""
     city_name = location_name.split(",", 1)[0].strip().lower()

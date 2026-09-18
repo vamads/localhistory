@@ -31,9 +31,13 @@ python preprocessing/01_build_category_filter.py
 python preprocessing/02_extract_wikipedia.py
 python preprocessing/03_fetch_wikidata_metadata.py
 python preprocessing/04_build_search_index.py
+python preprocessing/05_build_sqlite_search.py
 ```
 
-The final script writes `local_history_index.parquet`, which `search.py` reads.
+Script 04 writes `local_history_index.parquet`. Script 05 streams that Parquet
+file into `local_history_search.sqlite` and builds a persistent SQLite FTS5
+phrase index. Search uses SQLite when the database exists and is newer than the
+Parquet source, otherwise it falls back to the slower DuckDB literal scan.
 
 ## Profile search performance
 
@@ -48,3 +52,17 @@ python profile_search.py --query Detroit --lat 42.3314 --lon -83.0458 --repeats 
 The report includes cProfile hotspots, Python allocation peaks, process RSS,
 PyTorch device memory, and cache hit/miss counts. Use `--profile-output
 search.prof` to save a cProfile file for later inspection.
+
+## Profile the web API
+
+Measure server launch, the first HTTP search, and repeated warm searches using
+the same endpoint as the frontend:
+
+```bash
+python localhistory/profile_api.py
+python localhistory/profile_api.py --query Detroit --repeats 5
+```
+
+Run this from the `history_ML` repository root. The API also returns a
+`Server-Timing` header that separates geocoding, search, serialization, and
+total request time; it is visible on `/api/search` in browser developer tools.

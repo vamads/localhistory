@@ -15,6 +15,7 @@ import json
 import math
 import os
 import re
+import sqlite3
 import pandas as pd
 import numpy as np
 import duckdb
@@ -39,6 +40,7 @@ def resolve_data_dir() -> Path:
 
 DATA_DIR = resolve_data_dir()
 INDEX_PATH = DATA_DIR / "local_history_index.parquet"
+SQLITE_SEARCH_PATH = DATA_DIR / "local_history_search.sqlite"
 BM25_INDEX_PATH = DATA_DIR / "bm25_index"
 BM25_DOC_IDS_PATH = DATA_DIR / "bm25_doc_ids.json"
 KALM_EMBEDDINGS_DIR = DATA_DIR / "kalm_first_paragraph_embeddings"
@@ -47,7 +49,58 @@ KALM_MODEL_NAME = "KaLM-Embedding/KaLM-embedding-multilingual-mini-instruct-v2.5
 
 @lru_cache(maxsize=16)
 def load_candidate_index(location_name: str) -> pd.DataFrame:
-    """Load only articles containing the queried city in searchable text."""
+    """Load articles matching a city phrase, preferring the persistent FTS index."""
+    if (
+        SQLITE_SEARCH_PATH.exists()
+        and SQLITE_SEARCH_PATH.stat().st_mtime >= INDEX_PATH.stat().st_mtime
+    ):
+        return load_sqlite_candidates(location_name)
+    return load_duckdb_candidates(location_name)
+
+
+def location_phrase(location_name: str) -> str:
+    """Return the city portion as a safely quoted FTS5 phrase."""
+    city_name = location_name.split(",", 1)[0].strip().lower()
+    return '"' + city_name.replace('"', '""') + '"'
+
+
+def load_sqlite_candidates(location_name: str) -> pd.DataFrame:
+    """Retrieve matching article rows through the SQLite FTS5 word index."""
+    database_uri = f"file:{SQLITE_SEARCH_PATH}?mode=ro&immutable=1"
+    query = """
+        SELECT articles.*
+        FROM article_fts
+        JOIN articles ON articles.page_id = article_fts.rowid
+        WHERE article_fts MATCH ?
+          AND NOT articles.is_redirect
+        ORDER BY articles.page_id
+    """
+    with sqlite3.connect(database_uri, uri=True) as connection:
+        candidates = pd.read_sql_query(
+            query,
+            connection,
+            params=[location_phrase(location_name)],
+        )
+
+    for column in ("is_redirect", "is_list_article"):
+        candidates[column] = candidates[column].astype(bool)
+    candidates["instance_of"] = candidates["instance_of"].map(
+        parse_json_list
+    )
+    return candidates
+
+
+def parse_json_list(value) -> list:
+    """Restore a JSON list while treating SQL NULL/pandas NaN as empty."""
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return []
+    if isinstance(value, list):
+        return value
+    return json.loads(value)
+
+
+def load_duckdb_candidates(location_name: str) -> pd.DataFrame:
+    """Fallback literal scan used before the persistent FTS index is built."""
     city_name = location_name.split(",", 1)[0].strip().lower()
     query = """
         SELECT *

@@ -175,6 +175,15 @@ def build_database(
             inserted += len(frame)
             print(f"  imported {inserted:,}/{parquet.metadata.num_rows:,}")
 
+        print("Building coordinate index...")
+        connection.execute(
+            """
+            CREATE INDEX articles_lat_lon_idx ON articles(lat, lon)
+            WHERE lat IS NOT NULL AND lon IS NOT NULL
+            """
+        )
+        connection.commit()
+
         print("Building unicode61 full-text index...")
         connection.execute(
             "INSERT INTO article_fts(article_fts) VALUES('rebuild')"

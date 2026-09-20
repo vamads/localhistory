@@ -11,8 +11,8 @@ Run from the localhistory directory:
 """
 
 import argparse
-from collections import deque
 from concurrent.futures import ProcessPoolExecutor
+from itertools import islice
 import os
 from pathlib import Path
 import sqlite3
@@ -127,12 +127,6 @@ def build_database(
             ORDER BY page_id
             """
         )
-        def source_batches():
-            while True:
-                rows = cursor.fetchmany(batch_size)
-                if not rows:
-                    return
-                yield rows
 
         def store_batch(contexts, article_batch_size):
             nonlocal processed, context_count
@@ -152,34 +146,16 @@ def build_database(
 
         processed = 0
         context_count = 0
-        batches = source_batches()
+        batches = iter(lambda: cursor.fetchmany(batch_size), [])
         if workers <= 1:
             for rows in batches:
                 store_batch(extract_context_rows(rows), len(rows))
         else:
-            # Keep only a small number of full-text batches in flight; eagerly
-            # queuing the entire corpus would consume several gigabytes.
             with ProcessPoolExecutor(max_workers=workers) as executor:
-                pending = deque()
-                for _ in range(workers * 2):
-                    rows = next(batches, None)
-                    if rows is None:
-                        break
-                    pending.append(
-                        (executor.submit(extract_context_rows, rows), len(rows))
-                    )
-
-                while pending:
-                    future, article_batch_size = pending.popleft()
-                    store_batch(future.result(), article_batch_size)
-                    rows = next(batches, None)
-                    if rows is not None:
-                        pending.append(
-                            (
-                                executor.submit(extract_context_rows, rows),
-                                len(rows),
-                            )
-                        )
+                while group := list(islice(batches, workers * 2)):
+                    contexts = executor.map(extract_context_rows, group)
+                    for rows, context_rows in zip(group, contexts):
+                        store_batch(context_rows, len(rows))
 
         print("Optimizing citation FTS index...")
         output_connection.execute(

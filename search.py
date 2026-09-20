@@ -6,33 +6,23 @@ Hybrid local history search combining:
   2. BM25 retrieval          — fallback for articles without coordinates
   3. Scoring & ranking      — BM25, distance, entity class, hop, date
 
-Usage:
-    python search.py
 """
 
-import ast
-import json
 import math
 import os
-import re
 import sqlite3
 import pandas as pd
 import numpy as np
-import duckdb
 from pathlib import Path
-from collections import defaultdict
 from functools import lru_cache
 import torch
 
 try:
-    from .city_queries import precomputed_city_embedding
-    from .citation_index import (
-        CITATION_HEURISTIC_VERSION,
-        citation_context_count,
-    )
+    from .city_queries import precomputed_city_embedding, resolve_city_query
+    from .citation_index import CITATION_HEURISTIC_VERSION
 except ImportError:  # Support running search.py/profile_search.py as scripts.
-    from city_queries import precomputed_city_embedding
-    from citation_index import CITATION_HEURISTIC_VERSION, citation_context_count
+    from city_queries import precomputed_city_embedding, resolve_city_query
+    from citation_index import CITATION_HEURISTIC_VERSION
 
 def resolve_data_dir() -> Path:
     """Return the data directory, allowing local or deployed configuration."""
@@ -51,40 +41,103 @@ DATA_DIR = resolve_data_dir()
 INDEX_PATH = DATA_DIR / "local_history_index.parquet"
 SQLITE_SEARCH_PATH = DATA_DIR / "local_history_search.sqlite"
 CITATION_INDEX_PATH = DATA_DIR / "local_history_citations.sqlite"
-KALM_EMBEDDINGS_DIR = DATA_DIR / "kalm_first_paragraph_embeddings"
 KALM_EMBEDDING_MATRIX_PATH = DATA_DIR / "kalm_embeddings.npy"
 KALM_EMBEDDING_PAGE_IDS_PATH = DATA_DIR / "kalm_embedding_page_ids.npy"
 KALM_MODEL_NAME = "KaLM-Embedding/KaLM-embedding-multilingual-mini-instruct-v2.5"
+ARTICLE_COLUMNS = """
+    articles.page_id,
+    articles.title,
+    articles.first_paragraph,
+    articles.is_list_article,
+    articles.lat,
+    articles.lon,
+    articles.country,
+    articles.hop,
+    articles.year,
+    articles.entity_class
+"""
 
 
 @lru_cache(maxsize=16)
-def load_candidate_index(location_name: str) -> pd.DataFrame:
-    """Load articles matching a city phrase, preferring the persistent FTS index."""
-    if (
-        SQLITE_SEARCH_PATH.exists()
-        and SQLITE_SEARCH_PATH.stat().st_mtime >= INDEX_PATH.stat().st_mtime
+def load_candidate_index(
+    location_name: str,
+    user_lat: float,
+    user_lon: float,
+    radius_km: float,
+) -> pd.DataFrame:
+    """Load the union of geographically nearby and qualified text candidates."""
+    require_current_index(
+        SQLITE_SEARCH_PATH,
+        INDEX_PATH,
+        "python preprocessing/05_build_sqlite_search.py --overwrite",
+    )
+    text_candidates = load_sqlite_text_candidates(location_name)
+    nearby_candidates = load_sqlite_coordinate_candidates(
+        user_lat,
+        user_lon,
+        radius_km,
+    )
+    candidates = pd.concat([text_candidates, nearby_candidates]).drop_duplicates(
+        subset="page_id",
+        keep="first",
+    )
+    for column in (
+        "is_list_article",
+        "exact_title_match",
+        "lead_exact_match",
+        "exact_full_text_match",
     ):
-        return load_sqlite_candidates(location_name)
-    return load_duckdb_candidates(location_name)
+        candidates[column] = candidates[column].astype(bool)
+    return candidates.reset_index(drop=True)
 
 
-def location_phrase(location_name: str) -> str:
-    """Return the city portion as a safely quoted FTS5 phrase."""
-    city_name = location_name.split(",", 1)[0].strip().lower()
-    return '"' + city_name.replace('"', '""') + '"'
+def require_current_index(path: Path, source: Path, build_command: str) -> None:
+    if not path.exists():
+        raise FileNotFoundError(f"Missing search index: {path}\nRun: {build_command}")
+    if source.exists() and path.stat().st_mtime < source.stat().st_mtime:
+        raise RuntimeError(f"Stale search index: {path}\nRun: {build_command}")
+
+
+def quote_fts_phrase(value: str) -> str:
+    return '"' + value.strip().lower().replace('"', '""') + '"'
+
+
+def qualified_location_phrases(location_name: str) -> tuple[str, ...]:
+    """Build exact FTS phrases for a city paired with state/country aliases."""
+    parts = [part.strip() for part in location_name.split(",") if part.strip()]
+    city = resolve_city_query(location_name)
+    city_names = [parts[0]] if parts else []
+    qualifiers = parts[1:]
+    if city is not None:
+        canonical_parts = [
+            part.strip()
+            for part in city.canonical_query.split(",")
+            if part.strip()
+        ]
+        city_names.extend([city.name, canonical_parts[0]])
+        qualifiers.extend(canonical_parts[1:])
+        if city.admin1_name:
+            qualifiers.extend([city.admin1_name, city.admin1_code])
+
+    phrases = {
+        quote_fts_phrase(f"{name} {qualifier}")
+        for name in city_names
+        for qualifier in qualifiers
+        if name and qualifier
+    }
+    if not phrases:
+        raise ValueError(f"A state or country is required to search for {location_name!r}")
+    return tuple(sorted(phrases))
 
 
 @lru_cache(maxsize=32)
-def load_citation_counts(location_name: str) -> dict[int, int] | None:
-    """Return citation-sentence matches, or None when the index is unavailable."""
-    if (
-        not CITATION_INDEX_PATH.exists()
-        or not SQLITE_SEARCH_PATH.exists()
-        or SQLITE_SEARCH_PATH.stat().st_mtime < INDEX_PATH.stat().st_mtime
-        or CITATION_INDEX_PATH.stat().st_mtime
-        < SQLITE_SEARCH_PATH.stat().st_mtime
-    ):
-        return None
+def load_citation_counts(location_name: str) -> dict[int, int]:
+    """Return citation-sentence matches from the required FTS5 index."""
+    require_current_index(
+        CITATION_INDEX_PATH,
+        SQLITE_SEARCH_PATH,
+        "python preprocessing/08_build_citation_index.py --overwrite",
+    )
 
     database_uri = f"file:{CITATION_INDEX_PATH}?mode=ro&immutable=1"
     query = """
@@ -95,33 +148,34 @@ def load_citation_counts(location_name: str) -> dict[int, int] | None:
         WHERE citation_fts MATCH ?
         GROUP BY page_id
     """
-    try:
-        with sqlite3.connect(database_uri, uri=True) as connection:
-            metadata = dict(connection.execute("SELECT key, value FROM metadata"))
-            source_stat = SQLITE_SEARCH_PATH.stat()
-            if (
-                metadata.get("citation_heuristic_version")
-                != CITATION_HEURISTIC_VERSION
-                or metadata.get("source_size") != str(source_stat.st_size)
-                or metadata.get("source_mtime_ns")
-                != str(source_stat.st_mtime_ns)
-            ):
-                return None
-            rows = connection.execute(
-                query,
-                [location_phrase(location_name)],
-            ).fetchall()
-    except sqlite3.DatabaseError:
-        return None
+    with sqlite3.connect(database_uri, uri=True) as connection:
+        metadata = dict(connection.execute("SELECT key, value FROM metadata"))
+        source_stat = SQLITE_SEARCH_PATH.stat()
+        if (
+            metadata.get("citation_heuristic_version")
+            != CITATION_HEURISTIC_VERSION
+            or metadata.get("source_size") != str(source_stat.st_size)
+            or metadata.get("source_mtime_ns") != str(source_stat.st_mtime_ns)
+        ):
+            raise RuntimeError(
+                f"Stale citation index: {CITATION_INDEX_PATH}\n"
+                "Run: python preprocessing/08_build_citation_index.py --overwrite"
+            )
+        rows = connection.execute(
+            query,
+            [quote_fts_phrase(location_name.split(",", 1)[0])],
+        ).fetchall()
     return {int(page_id): int(count) for page_id, count in rows}
 
 
-def load_sqlite_candidates(location_name: str) -> pd.DataFrame:
-    """Retrieve matching article rows through the SQLite FTS5 word index."""
+def load_sqlite_text_candidates(location_name: str) -> pd.DataFrame:
+    """Retrieve articles containing a qualified place phrase."""
     database_uri = f"file:{SQLITE_SEARCH_PATH}?mode=ro&immutable=1"
-    query = """
+    phrases = qualified_location_phrases(location_name)
+    match_query = " OR ".join(phrases)
+    query = f"""
         SELECT
-            articles.*,
+            {ARTICLE_COLUMNS},
             -bm25(article_fts, 10.0, 3.0, 1.0) AS bm25_score
         FROM article_fts
         JOIN articles ON articles.page_id = article_fts.rowid
@@ -133,44 +187,60 @@ def load_sqlite_candidates(location_name: str) -> pd.DataFrame:
         candidates = pd.read_sql_query(
             query,
             connection,
-            params=[location_phrase(location_name)],
+            params=[match_query],
         )
+        for fts_column, result_column in (
+            ("title", "exact_title_match"),
+            ("first_paragraph", "lead_exact_match"),
+            ("full_text", "exact_full_text_match"),
+        ):
+            matches = connection.execute(
+                "SELECT rowid FROM article_fts WHERE article_fts MATCH ?",
+                [" OR ".join(f"{fts_column} : {phrase}" for phrase in phrases)],
+            )
+            page_ids = {page_id for (page_id,) in matches}
+            candidates[result_column] = candidates["page_id"].isin(page_ids)
 
-    for column in ("is_redirect", "is_list_article"):
-        candidates[column] = candidates[column].astype(bool)
-    candidates["instance_of"] = candidates["instance_of"].map(
-        parse_json_list
-    )
     return candidates
 
 
-def parse_json_list(value) -> list:
-    """Restore a JSON list while treating SQL NULL/pandas NaN as empty."""
-    if value is None or (isinstance(value, float) and math.isnan(value)):
-        return []
-    if isinstance(value, list):
-        return value
-    return json.loads(value)
+def load_sqlite_coordinate_candidates(
+    user_lat: float,
+    user_lon: float,
+    radius_km: float,
+) -> pd.DataFrame:
+    """Retrieve a bounding box around the search point without a text filter."""
+    latitude_delta = radius_km / 111.0
+    longitude_delta = radius_km / max(
+        1.0,
+        111.0 * abs(math.cos(math.radians(user_lat))),
+    )
+    longitude_clause = "articles.lon BETWEEN ? AND ?"
+    parameters = [
+        user_lat - latitude_delta,
+        user_lat + latitude_delta,
+        user_lon - longitude_delta,
+        user_lon + longitude_delta,
+    ]
+    if parameters[2] < -180 or parameters[3] > 180:
+        longitude_clause = "1 = 1"
+        parameters = parameters[:2]
 
-
-def load_duckdb_candidates(location_name: str) -> pd.DataFrame:
-    """Fallback literal scan used before the persistent FTS index is built."""
-    city_name = location_name.split(",", 1)[0].strip().lower()
-    query = """
-        SELECT *, 0.0::DOUBLE AS bm25_score
-        FROM read_parquet(?)
-        WHERE NOT is_redirect
-          AND (
-              contains(lower(coalesce(title, '')), ?)
-              OR contains(lower(coalesce(first_paragraph, '')), ?)
-              OR contains(lower(coalesce(full_text, '')), ?)
-          )
+    query = f"""
+        SELECT
+            {ARTICLE_COLUMNS},
+            0.0 AS bm25_score,
+            0 AS exact_title_match,
+            0 AS lead_exact_match,
+            0 AS exact_full_text_match
+        FROM articles
+        WHERE NOT articles.is_redirect
+          AND articles.lat BETWEEN ? AND ?
+          AND {longitude_clause}
     """
-    with duckdb.connect() as connection:
-        return connection.execute(
-            query,
-            [str(INDEX_PATH), city_name, city_name, city_name],
-        ).fetchdf()
+    database_uri = f"file:{SQLITE_SEARCH_PATH}?mode=ro&immutable=1"
+    with sqlite3.connect(database_uri, uri=True) as connection:
+        return pd.read_sql_query(query, connection, params=parameters)
 
 
 def kalm_device() -> str:
@@ -183,301 +253,6 @@ def kalm_device() -> str:
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         return "mps"
     return "cpu"
-
-# ── Entity type sets ──────────────────────────────────────────────────────────
-
-PERSON_TYPES = {"human", "person", "fictional human", "fictional character"}
-
-EVENT_TYPES = {
-    "battle",
-    "war",
-    "revolution",
-    "historical event",
-    "event",
-    "armed conflict",
-    "conflict",
-    "election",
-    "treaty",
-    "massacre",
-    "siege",
-    "incident",
-    "protest",
-    "rebellion",
-    "uprising",
-    "ethnic riot",
-    "riot",
-    "race riot",
-    "pogrom",
-    "labor dispute",
-    "strike action",
-    "march",
-    "demonstration",
-    "coup",
-    "assassination",
-    "execution",
-    "trial",
-    "disaster",
-    "fire",
-    "flood",
-    "earthquake",
-    "famine",
-    "epidemic",
-    "pandemic",
-    "expedition",
-    "voyage",
-}
-
-PLACE_TYPES = {
-    "city",
-    "municipality",
-    "town",
-    "village",
-    "country",
-    "state",
-    "region",
-    "archaeological site",
-    "building",
-    "church",
-    "castle",
-    "fort",
-    "monument",
-    "museum",
-    "archaeological museum",
-    "art museum",
-    "history museum",
-    "natural history museum",
-    "library",
-    "archive",
-    "hospital",
-    "psychiatric hospital",
-    "factory",
-    "assembly plant",
-    "airport",
-    "airfield",
-    "lake",
-    "reservoir",
-    "island",
-    "park",
-    "synagogue",
-    "mosque",
-    "temple",
-    "tekke",
-    "university",
-    "neighborhood",
-    "historic district",
-    "unincorporated community",
-    "house",
-    "duplex",
-    "apartment building",
-    "residential building",
-    "public housing",
-    "housing project",
-    "estate",
-    "manor",
-    "garden",
-    "national historic landmark",
-    "heritage site",
-    "listed building",
-    "tower",
-    "palace",
-    "prison",
-    "courthouse",
-    "school",
-    "college",
-    "stadium",
-    "arena",
-    "theater",
-    "theatre",
-    "opera house",
-    "cemetery",
-    "battlefield",
-    "memorial",
-    "plaza",
-    "square",
-    "harbor",
-    "port",
-    "canal",
-    "railway station",
-    "train station",
-    "road",
-    "street",
-    "bridge",
-    "tunnel",
-    "dam",
-}
-
-WORK_TYPES = {
-    "book",
-    "novel",
-    "film",
-    "painting",
-    "newspaper",
-    "journal",
-    "magazine",
-    "song",
-    "album",
-    "artwork",
-    "document",
-    "periodical",
-    "underground press",
-    "newsletter",
-    "art project",
-    "art installation",
-    "public art",
-    "mural",
-    "sculpture",
-    "photograph",
-    "documentary",
-    "television series",
-    "radio program",
-    "poem",
-    "play",
-    "opera",
-    "musical",
-    "comic book",
-}
-
-ORG_TYPES = {
-    "organization",
-    "nonprofit organization",
-    "association",
-    "political party",
-    "trade union",
-    "community organization",
-    "religious organization",
-    "diaspora organization",
-    "episcopate",
-    "diocese",
-    "company",
-    "institution",
-    "government agency",
-    "military unit",
-    "regiment",
-    "brigade",
-    "society",
-    "club",
-    "fraternity",
-    "sorority",
-    "guild",
-    "corporation",
-    "foundation",
-    "institute",
-    "think tank",
-    "newspaper publisher",
-    "record label",
-    "studio",
-}
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-
-def parse_instance_of(val):
-    if val is None:
-        return []
-    if isinstance(val, (list, tuple)):
-        return list(val)
-    if isinstance(val, np.ndarray):
-        return val.tolist()
-    if isinstance(val, str):
-        try:
-            parsed = ast.literal_eval(val)
-            return parsed if isinstance(parsed, list) else [parsed]
-        except Exception:
-            return [val]
-    if hasattr(val, "__iter__"):
-        return list(val)
-    return []
-
-
-def get_entity_class(instance_of, title="", first_para="") -> str:
-    types = parse_instance_of(instance_of)
-    types_lower = {t.lower().strip() for t in types} if types else set()
-
-    if types_lower & PERSON_TYPES:
-        return "person"
-    if types_lower & EVENT_TYPES:
-        return "event"
-    if types_lower & PLACE_TYPES:
-        return "place"
-    if types_lower & WORK_TYPES:
-        return "work"
-    if types_lower & ORG_TYPES:
-        return "organization"
-
-    # Text-based fallback for empty or unmatched instance_of
-    text = (title + " " + (first_para or "")).lower()
-    if any(
-        w in text
-        for w in [
-            "riot",
-            "battle",
-            "massacre",
-            "siege",
-            "uprising",
-            "revolution",
-            "rebellion",
-            "march",
-            "strike",
-        ]
-    ):
-        return "event"
-    if any(
-        w in text
-        for w in [
-            "museum",
-            "library",
-            "building",
-            "house",
-            "park",
-            "church",
-            "hospital",
-            "school",
-            "neighborhood",
-        ]
-    ):
-        return "place"
-    if any(
-        w in text
-        for w in [
-            "organization",
-            "society",
-            "movement",
-            "association",
-            "party",
-            "union",
-            "company",
-            "corporation",
-        ]
-    ):
-        return "organization"
-    if any(
-        w in text
-        for w in [
-            "newspaper",
-            "magazine",
-            "journal",
-            "album",
-            "novel",
-            "film",
-            "painting",
-            "sculpture",
-        ]
-    ):
-        return "work"
-    return "other"
-
-
-def haversine_km(lat1, lon1, lat2, lon2) -> float:
-    R = 6371.0
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlambda = math.radians(lon2 - lon1)
-    a = (
-        math.sin(dphi / 2) ** 2
-        + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
-    )
-    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-
 
 @lru_cache(maxsize=1)
 def load_kalm_model():
@@ -496,39 +271,33 @@ def load_kalm_model():
 @lru_cache(maxsize=1)
 def load_kalm_embeddings():
     """Memory-map embeddings and their sorted page IDs without loading vectors."""
-    if KALM_EMBEDDING_MATRIX_PATH.exists() and KALM_EMBEDDING_PAGE_IDS_PATH.exists():
-        matrix = np.load(KALM_EMBEDDING_MATRIX_PATH, mmap_mode="r")
-        page_ids = np.load(KALM_EMBEDDING_PAGE_IDS_PATH, mmap_mode="r")
-        if matrix.ndim != 2:
-            raise ValueError(
-                f"Expected a 2D embedding matrix, found shape {matrix.shape}"
-            )
-        if page_ids.ndim != 1 or len(page_ids) != len(matrix):
-            raise ValueError(
-                "Embedding page IDs and matrix have incompatible shapes: "
-                f"{page_ids.shape} and {matrix.shape}"
-            )
-        if len(page_ids) > 1 and np.any(page_ids[1:] <= page_ids[:-1]):
-            raise ValueError("Memory-mapped embedding page IDs must be unique and sorted")
-        return matrix, page_ids
+    if not (
+        KALM_EMBEDDING_MATRIX_PATH.exists()
+        and KALM_EMBEDDING_PAGE_IDS_PATH.exists()
+    ):
+        raise FileNotFoundError(
+            "Missing memory-mapped embeddings. Run: "
+            "python preprocessing/06_build_embedding_memmap.py --overwrite"
+        )
 
-    # Compatibility fallback for installations that have not built the
-    # memory-mapped files yet. This retains the former high-memory behavior.
-    embedding_files = sorted(KALM_EMBEDDINGS_DIR.glob("embeddings_*.parquet"))
-    if not embedding_files:
-        return np.empty((0, 0), dtype=np.float32), np.empty(0, dtype=np.int64)
-
-    chunks = [pd.read_parquet(path, columns=["page_id", "embedding"])
-              for path in embedding_files]
-    embeddings = pd.concat(chunks, ignore_index=True)
-    matrix = np.vstack(embeddings["embedding"].to_numpy()).astype(np.float32)
-    page_ids = embeddings["page_id"].to_numpy(dtype=np.int64, copy=True)
-    order = np.argsort(page_ids, kind="stable")
-    return matrix[order], page_ids[order]
+    matrix = np.load(KALM_EMBEDDING_MATRIX_PATH, mmap_mode="r")
+    page_ids = np.load(KALM_EMBEDDING_PAGE_IDS_PATH, mmap_mode="r")
+    if matrix.ndim != 2:
+        raise ValueError(f"Expected a 2D embedding matrix, found {matrix.shape}")
+    if page_ids.ndim != 1 or len(page_ids) != len(matrix):
+        raise ValueError(
+            f"Embedding shapes do not match: {page_ids.shape} and {matrix.shape}"
+        )
+    if len(page_ids) > 1 and np.any(page_ids[1:] <= page_ids[:-1]):
+        raise ValueError("Embedding page IDs must be unique and sorted")
+    return matrix, page_ids
 
 
 @lru_cache(maxsize=16)
-def kalm_scores(location_name: str, target_page_ids=None) -> pd.Series:
+def kalm_scores(
+    location_name: str,
+    target_page_ids: tuple[int, ...],
+) -> pd.Series:
     """Return cosine similarity to each stored first-paragraph embedding."""
     embedding_matrix, embedding_page_ids = load_kalm_embeddings()
     if len(embedding_page_ids) == 0:
@@ -550,16 +319,12 @@ def kalm_scores(location_name: str, target_page_ids=None) -> pd.Series:
     device = kalm_device()
     query = torch.from_numpy(query_embedding).to(device)
 
-    if target_page_ids is None:
-        rows = np.arange(len(embedding_page_ids), dtype=np.int64)
-        selected_page_ids = np.asarray(embedding_page_ids)
-    else:
-        requested_page_ids = np.fromiter(target_page_ids, dtype=np.int64)
-        rows = np.searchsorted(embedding_page_ids, requested_page_ids)
-        valid = rows < len(embedding_page_ids)
-        valid[valid] &= embedding_page_ids[rows[valid]] == requested_page_ids[valid]
-        rows = rows[valid]
-        selected_page_ids = requested_page_ids[valid]
+    requested_page_ids = np.fromiter(target_page_ids, dtype=np.int64)
+    rows = np.searchsorted(embedding_page_ids, requested_page_ids)
+    valid = rows < len(embedding_page_ids)
+    valid[valid] &= embedding_page_ids[rows[valid]] == requested_page_ids[valid]
+    rows = rows[valid]
+    selected_page_ids = requested_page_ids[valid]
     if len(rows) == 0:
         return pd.Series(dtype="float32")
 
@@ -580,12 +345,6 @@ def kalm_scores(location_name: str, target_page_ids=None) -> pd.Series:
     )
 
 
-@lru_cache(maxsize=1)
-def load_coordinate_index() -> pd.DataFrame:
-    """Load coordinate columns once for vectorized radius filtering."""
-    return pd.read_parquet(INDEX_PATH, columns=["page_id", "lat", "lon"])
-
-
 def normalize_scores(values: pd.Series) -> pd.Series:
     """Min-max normalize one query's scores to [0, 1]."""
     minimum = values.min()
@@ -593,11 +352,6 @@ def normalize_scores(values: pd.Series) -> pd.Series:
     if pd.isna(minimum) or maximum <= minimum:
         return pd.Series(0.0, index=values.index)
     return (values - minimum) / (maximum - minimum)
-
-
-def city_core(location_name: str) -> str:
-    """Use the city portion before an optional state/country qualifier."""
-    return location_name.split(",", 1)[0].strip()
 
 
 # ── Main search ───────────────────────────────────────────────────────────────
@@ -611,78 +365,34 @@ def search_local_history(
     top_n: int = 30,
     bm25_min_score: float = 1.0,
     kalm_top_k: int = 200,
-    worst_n: int = 10,
-    fallback_top_n: int = 15,
     index: pd.DataFrame = None,
 ) -> dict:
     if index is None:
-        index = load_candidate_index(location_name)
-
-    df = index[~index["is_redirect"]].copy()
-
-    # Reuse the precomputed classification. Reclassifying every article on
-    # every query is an expensive full-corpus row-wise operation. Older
-    # indexes without this column still get the previous fallback behavior.
-    if "entity_class" not in df.columns:
-        df["entity_class"] = df.apply(
-            lambda r: get_entity_class(
-                r["instance_of"], r["title"], r["first_paragraph"]
-            ),
-            axis=1,
+        index = load_candidate_index(
+            location_name,
+            user_lat,
+            user_lon,
+            radius_km,
         )
 
-    # SQLite FTS5 computes BM25 while retrieving phrase-matched candidates.
-    # Older/custom DataFrames and the DuckDB fallback receive a neutral score.
-    if "bm25_score" not in df.columns:
-        df["bm25_score"] = 0.0
-    else:
-        df["bm25_score"] = pd.to_numeric(
-            df["bm25_score"], errors="coerce"
-        ).fillna(0.0)
+    df = index.copy()
 
-    # Exact phrase evidence. A qualifier such as ", MI" or ", Michigan" is
-    # ignored for matching, so both queries use the core phrase "Ann Arbor".
-    city_name = city_core(location_name)
-    location_pattern = re.compile(
-        rf"(?<!\w){re.escape(city_name)}(?!\w)",
-        re.IGNORECASE,
-    )
-    df["exact_title_match"] = df["title"].fillna("").str.contains(
-        location_pattern, na=False
-    )
-    full_text = df["full_text"].fillna("")
-    # The city name is a literal string, so avoid running the regex engine over
-    # every long article. Recheck only literal matches with the boundary-aware
-    # regex to preserve the original matching semantics.
-    literal_full_text_match = full_text.str.contains(
-        city_name, case=False, regex=False, na=False
-    )
-    df["exact_full_text_match"] = False
-    literal_matches = literal_full_text_match[literal_full_text_match].index
-    df.loc[literal_matches, "exact_full_text_match"] = full_text.loc[
-        literal_matches
-    ].map(lambda text: bool(location_pattern.search(text)))
+    df["bm25_score"] = pd.to_numeric(
+        df["bm25_score"], errors="coerce"
+    ).fillna(0.0)
     df["exact_score"] = (
         10 * df["exact_title_match"].astype(float)
         + 3 * df["exact_full_text_match"].astype(float)
     )
-    df["lead_exact_match"] = df["first_paragraph"].fillna("").str.contains(
-        location_pattern, na=False
+    text_match = (
+        df["exact_title_match"]
+        | df["lead_exact_match"]
+        | df["exact_full_text_match"]
     )
-    exact_city_match = df["exact_title_match"] | df["exact_full_text_match"]
     citation_counts = load_citation_counts(location_name)
-    df["citation_context_count"] = 0
-    if citation_counts is None:
-        df.loc[exact_city_match, "citation_context_count"] = df.loc[
-            exact_city_match, "full_text"
-        ].apply(lambda text: citation_context_count(text, location_pattern))
-    else:
-        df.loc[exact_city_match, "citation_context_count"] = (
-            df.loc[exact_city_match, "page_id"]
-            .map(citation_counts)
-            .fillna(0)
-            .astype("int8")
-        )
+    df["citation_context_count"] = (
+        df["page_id"].map(citation_counts).fillna(0).astype("int8")
+    )
     # Citation context is a weak negative signal, not a per-reference
     # subtraction. Strong title/lead evidence means the article is topical,
     # even if it contains many ordinary bibliographic references.
@@ -695,11 +405,17 @@ def search_local_history(
     # KaLM embeddings represent first paragraphs (see kalm_embeddings.py).
     kalm_by_page_id = kalm_scores(
         location_name,
-        tuple(df.loc[exact_city_match, "page_id"].tolist()),
+        tuple(df.loc[text_match, "page_id"].tolist()),
     )
     df["kalm_score"] = df["page_id"].map(kalm_by_page_id).fillna(0.0)
-    df["bm25_score_normalized"] = normalize_scores(df["bm25_score"])
-    df["kalm_score_normalized"] = normalize_scores(df["kalm_score"])
+    df["bm25_score_normalized"] = 0.0
+    df["kalm_score_normalized"] = 0.0
+    df.loc[text_match, "bm25_score_normalized"] = normalize_scores(
+        df.loc[text_match, "bm25_score"]
+    )
+    df.loc[text_match, "kalm_score_normalized"] = normalize_scores(
+        df.loc[text_match, "kalm_score"]
+    )
 
     # Layer 1: coordinate proximity. The candidate index already contains
     # coordinates, so do not reload the full coordinate corpus.
@@ -725,10 +441,9 @@ def search_local_history(
     # Layer 2: BM25 fallback for articles without coordinate candidates.
     # BM25 scores individual terms, so require the complete city phrase here.
     nearby_ids = set(nearby["page_id"])
-    exact_city_match = df["exact_title_match"] | df["exact_full_text_match"]
     bm25_matches = df[
         (df["bm25_score"] >= bm25_min_score)
-        & exact_city_match
+        & text_match
         & ~df["page_id"].isin(nearby_ids)
         & df["lat"].isna()
     ].copy()
@@ -736,7 +451,7 @@ def search_local_history(
     bm25_matches["source"] = "bm25"
 
     # Add exact-title and semantic candidates that BM25 may miss.
-    ranked_kalm = df[exact_city_match].nlargest(kalm_top_k, "kalm_score")
+    ranked_kalm = df[text_match].nlargest(kalm_top_k, "kalm_score")
     extra_matches = df[
         (
             df["exact_title_match"]
@@ -753,200 +468,24 @@ def search_local_history(
         subset="page_id", keep="first"
     )
 
-    # Composite score
-    def composite_score(row):
-        s = 0.0
-        s += row.get("exact_score", 0)
-        s -= row.get("citation_penalty", 0)
-        s += 5 * row.get("bm25_score_normalized", 0)
-        s += 2 * row.get("kalm_score_normalized", 0)
-        dist = row.get("distance_km")
-        if pd.notna(dist) and dist is not None:
-            s += max(0, 20 - dist * 0.4)
-        hop = row.get("hop")
-        if pd.notna(hop):
-            s += (5 - hop) * 2
-        s += {
-            "event": 4,
-            "place": 3,
-            "person": 2,
-            "work": 1,
-            "organization": 2,
-            "other": 0,
-        }.get(row.get("entity_class", "other"), 0)
-        if pd.notna(row.get("year")):
-            s += 2
-        if row.get("is_list_article", False):
-            s -= 5
-        return s
-
-    combined["score"] = combined.apply(composite_score, axis=1)
-    combined["coordinate_priority"] = (
-        combined["source"] == "coordinates"
-    ).astype(int)
-    results = combined.sort_values(
-        ["coordinate_priority", "score"],
-        ascending=[False, False],
-    ).head(top_n)
-    worst_matches = combined.sort_values("score", ascending=True).head(worst_n)
-    fallback_matches = (
-        combined[combined["source"] != "coordinates"]
-        .sort_values("score", ascending=False)
-        .head(fallback_top_n)
-    )
-
-    # Timeline
-    def century_label(year):
-        if pd.isna(year) or year is None:
-            return None
-        y = int(year)
-        if y < 0:
-            c = abs(y) // 100 + 1
-            sfx = {1: "st", 2: "nd", 3: "rd"}.get(
-                c % 10 if c % 100 not in [11, 12, 13] else 0, "th"
-            )
-            return f"{c}{sfx} century BCE"
-        c = y // 100 + 1
-        sfx = {1: "st", 2: "nd", 3: "rd"}.get(
-            c % 10 if c % 100 not in [11, 12, 13] else 0, "th"
-        )
-        return f"{c}{sfx} century"
-
-    datable = results[results["year"].notna()].copy()
-    datable["century"] = datable["year"].apply(century_label)
-    by_century = defaultdict(list)
-    for _, row in datable.sort_values("year").iterrows():
-        by_century[row["century"]].append(row["title"])
-
-    by_class = defaultdict(list)
-    for _, row in results.iterrows():
-        by_class[row["entity_class"]].append(row["title"])
-
-    surprising = results[
-        (results["entity_class"].isin({"work", "event"}))
-        & (results["distance_km"].notna())
-        & (results["distance_km"] < radius_km / 2)
-    ].head(5)
+    score = combined["exact_score"].astype(float)
+    score -= combined["citation_penalty"]
+    score += 5 * combined["bm25_score_normalized"]
+    score += 2 * combined["kalm_score_normalized"]
+    score += (20 - combined["distance_km"] * 0.4).clip(lower=0).fillna(0)
+    score += ((5 - combined["hop"]) * 2).fillna(0)
+    score += combined["entity_class"].map(
+        {"event": 4, "place": 3, "person": 2, "work": 1, "organization": 2}
+    ).fillna(0)
+    score += 2 * combined["year"].notna()
+    score -= 5 * combined["is_list_article"].astype(float)
+    combined["score"] = score
+    results = combined.sort_values("score", ascending=False).head(top_n)
 
     return {
         "results": results,
-        "worst_matches": worst_matches,
-        "fallback_matches": fallback_matches,
-        "by_century": dict(by_century),
-        "by_class": dict(by_class),
-        "surprising": surprising,
         "stats": {
             "total_found": len(combined),
             "from_coords": (combined["source"] == "coordinates").sum(),
-            "from_bm25": (combined["source"] == "bm25").sum(),
-            "from_exact_or_kalm": (combined["source"] == "exact_or_kalm").sum(),
-            "citation_context_matches": (
-                combined["citation_context_count"] > 0
-            ).sum(),
-            "bm25_min_score": bm25_min_score,
-            "bm25_matches_before_coordinate_filter": (
-                (df["bm25_score"] >= bm25_min_score)
-                & exact_city_match
-                & df["lat"].isna()
-            ).sum(),
-            "with_dates": results["year"].notna().sum(),
         },
     }
-
-
-# ── Print results ─────────────────────────────────────────────────────────────
-
-
-def print_results(output: dict, location_name: str):
-    stats = output["stats"]
-    results = output["results"]
-
-    print(f"\n{'='*65}")
-    print(f"Local history near {location_name}")
-    print(f"{'='*65}")
-    print(
-        f"Found {stats['total_found']} articles "
-        f"({stats['from_coords']} by coordinates, "
-        f"{stats['from_bm25']} by BM25 fallback, "
-        f"{stats['from_exact_or_kalm']} exact/KaLM fallback)"
-    )
-    print(
-        f"BM25 threshold: {stats['bm25_min_score']} "
-        f"({stats['bm25_matches_before_coordinate_filter']} no-coordinate matches)"
-    )
-    print(
-        f"Candidates with citation-like city context: "
-        f"{stats['citation_context_matches']}"
-    )
-    print(f"{stats['with_dates']} have dates for timeline\n")
-
-    print("── Top BM25/KaLM fallback matches ──────────────────────────")
-    for _, row in output["fallback_matches"].iterrows():
-        print(
-            f"  [{row['source']:<14}] {row['title']} "
-            f"score={row['score']:.2f} "
-            f"(exact={row.get('exact_score', 0):.0f}, "
-            f"citation_penalty={row.get('citation_penalty', 0):.0f}, "
-            f"bm25={row.get('bm25_score', 0):.2f}, "
-            f"kalm={row.get('kalm_score', 0):.3f})"
-        )
-
-    print("── Worst candidate matches ──────────────────────────────────")
-    for _, row in output["worst_matches"].iterrows():
-        print(
-            f"  [{row['source']:<14}] {row['title']} "
-            f"score={row['score']:.2f} "
-            f"(exact={row.get('exact_score', 0):.0f}, "
-            f"citation_penalty={row.get('citation_penalty', 0):.0f}, "
-            f"bm25={row.get('bm25_score', 0):.2f}, "
-            f"kalm={row.get('kalm_score', 0):.3f})"
-        )
-
-    print("── Top results ──────────────────────────────────────────────")
-    for _, row in results.head(20).iterrows():
-        dist = (
-            f"{row['distance_km']:.1f}km"
-            if pd.notna(row.get("distance_km"))
-            else "BM25 match"
-        )
-        year = f" [{int(row['year'])}]" if pd.notna(row.get("year")) else ""
-        print(
-            f"  [{row['entity_class']:<12}] {row['title']}{year}  ({dist})  score={row['score']:.1f}"
-        )
-
-    if output["by_century"]:
-        print("\n── Timeline ─────────────────────────────────────────────────")
-        for century, titles in sorted(output["by_century"].items()):
-            print(f"  {century}:")
-            for t in titles[:3]:
-                print(f"    • {t}")
-
-    print("\n── By type ──────────────────────────────────────────────────")
-    for cls, titles in output["by_class"].items():
-        print(f"  {cls} ({len(titles)}): {', '.join(titles[:3])}")
-
-    if len(output["surprising"]) > 0:
-        print("\n── Surprising connections ───────────────────────────────────")
-        for _, row in output["surprising"].iterrows():
-            print(f"  {row['title']} [{row['entity_class']}]")
-
-
-if __name__ == "__main__":
-    print("Loading index ...")
-    index = load_candidate_index("Ann Arbor")
-    print(f"  {len(index):,} articles loaded")
-
-    for location, lat, lon in [
-        ("Ann Arbor", 42.2808, -83.7430),
-        ("Detroit", 42.3314, -83.0458),
-    ]:
-        output = search_local_history(
-            location_name=location,
-            user_lat=lat,
-            user_lon=lon,
-            radius_km=50,
-            top_n=30,
-            index=index,
-        )
-        print_results(output, location)
-        print()

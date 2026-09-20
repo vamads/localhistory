@@ -20,11 +20,9 @@ One row per article. Columns:
 
 import re
 import ast
-import json
 import os
 import pandas as pd
 import numpy as np
-import bm25s
 from pathlib import Path
 
 
@@ -326,23 +324,5 @@ print(f"  {df['year'].notna().sum():,} articles have a year for timeline")
 out = DATA_DIR / "local_history_index.parquet"
 df.to_parquet(out, index=False, compression="snappy")
 
-# Build BM25 once. Persist document order separately so search.py can map
-# BM25 document positions back to page_id values.
-bm25_df = df[~df["is_redirect"].fillna(False)].copy()
-bm25_corpus = bm25_df["full_text"].fillna("").tolist()
-bm25_tokens = bm25s.tokenize(bm25_corpus)
-bm25_retriever = bm25s.BM25()
-bm25_retriever.index(bm25_tokens)
-bm25_retriever.save(DATA_DIR / "bm25_index")
-(DATA_DIR / "bm25_doc_ids.json").write_text(
-    json.dumps(
-        [
-            int(page_id) if isinstance(page_id, np.integer) else page_id
-            for page_id in bm25_df["page_id"].tolist()
-        ]
-    )
-)
-
 print(f"\nSaved → {out}")
-print(f"Saved BM25 index → {DATA_DIR / 'bm25_index'}")
 print(f"Columns: {df.columns.tolist()}")

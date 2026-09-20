@@ -22,8 +22,17 @@ import duckdb
 from pathlib import Path
 from collections import defaultdict
 from functools import lru_cache
-import bm25s
 import torch
+
+try:
+    from .city_queries import precomputed_city_embedding
+    from .citation_index import (
+        CITATION_HEURISTIC_VERSION,
+        citation_context_count,
+    )
+except ImportError:  # Support running search.py/profile_search.py as scripts.
+    from city_queries import precomputed_city_embedding
+    from citation_index import CITATION_HEURISTIC_VERSION, citation_context_count
 
 def resolve_data_dir() -> Path:
     """Return the data directory, allowing local or deployed configuration."""
@@ -41,9 +50,10 @@ def resolve_data_dir() -> Path:
 DATA_DIR = resolve_data_dir()
 INDEX_PATH = DATA_DIR / "local_history_index.parquet"
 SQLITE_SEARCH_PATH = DATA_DIR / "local_history_search.sqlite"
-BM25_INDEX_PATH = DATA_DIR / "bm25_index"
-BM25_DOC_IDS_PATH = DATA_DIR / "bm25_doc_ids.json"
+CITATION_INDEX_PATH = DATA_DIR / "local_history_citations.sqlite"
 KALM_EMBEDDINGS_DIR = DATA_DIR / "kalm_first_paragraph_embeddings"
+KALM_EMBEDDING_MATRIX_PATH = DATA_DIR / "kalm_embeddings.npy"
+KALM_EMBEDDING_PAGE_IDS_PATH = DATA_DIR / "kalm_embedding_page_ids.npy"
 KALM_MODEL_NAME = "KaLM-Embedding/KaLM-embedding-multilingual-mini-instruct-v2.5"
 
 
@@ -64,11 +74,55 @@ def location_phrase(location_name: str) -> str:
     return '"' + city_name.replace('"', '""') + '"'
 
 
+@lru_cache(maxsize=32)
+def load_citation_counts(location_name: str) -> dict[int, int] | None:
+    """Return citation-sentence matches, or None when the index is unavailable."""
+    if (
+        not CITATION_INDEX_PATH.exists()
+        or not SQLITE_SEARCH_PATH.exists()
+        or SQLITE_SEARCH_PATH.stat().st_mtime < INDEX_PATH.stat().st_mtime
+        or CITATION_INDEX_PATH.stat().st_mtime
+        < SQLITE_SEARCH_PATH.stat().st_mtime
+    ):
+        return None
+
+    database_uri = f"file:{CITATION_INDEX_PATH}?mode=ro&immutable=1"
+    query = """
+        SELECT
+            CAST(page_id AS INTEGER) AS page_id,
+            MIN(2, count(*)) AS context_count
+        FROM citation_fts
+        WHERE citation_fts MATCH ?
+        GROUP BY page_id
+    """
+    try:
+        with sqlite3.connect(database_uri, uri=True) as connection:
+            metadata = dict(connection.execute("SELECT key, value FROM metadata"))
+            source_stat = SQLITE_SEARCH_PATH.stat()
+            if (
+                metadata.get("citation_heuristic_version")
+                != CITATION_HEURISTIC_VERSION
+                or metadata.get("source_size") != str(source_stat.st_size)
+                or metadata.get("source_mtime_ns")
+                != str(source_stat.st_mtime_ns)
+            ):
+                return None
+            rows = connection.execute(
+                query,
+                [location_phrase(location_name)],
+            ).fetchall()
+    except sqlite3.DatabaseError:
+        return None
+    return {int(page_id): int(count) for page_id, count in rows}
+
+
 def load_sqlite_candidates(location_name: str) -> pd.DataFrame:
     """Retrieve matching article rows through the SQLite FTS5 word index."""
     database_uri = f"file:{SQLITE_SEARCH_PATH}?mode=ro&immutable=1"
     query = """
-        SELECT articles.*
+        SELECT
+            articles.*,
+            -bm25(article_fts, 10.0, 3.0, 1.0) AS bm25_score
         FROM article_fts
         JOIN articles ON articles.page_id = article_fts.rowid
         WHERE article_fts MATCH ?
@@ -103,7 +157,7 @@ def load_duckdb_candidates(location_name: str) -> pd.DataFrame:
     """Fallback literal scan used before the persistent FTS index is built."""
     city_name = location_name.split(",", 1)[0].strip().lower()
     query = """
-        SELECT *
+        SELECT *, 0.0::DOUBLE AS bm25_score
         FROM read_parquet(?)
         WHERE NOT is_redirect
           AND (
@@ -426,19 +480,6 @@ def haversine_km(lat1, lon1, lat2, lon2) -> float:
 
 
 @lru_cache(maxsize=1)
-def load_bm25_index():
-    """Load the persisted BM25 index and its page-id mapping."""
-    retriever = bm25s.BM25.load(
-        BM25_INDEX_PATH,
-        load_corpus=False,
-        mmap=True,
-    )
-    with BM25_DOC_IDS_PATH.open() as f:
-        page_ids = json.load(f)
-    return retriever, page_ids
-
-
-@lru_cache(maxsize=1)
 def load_kalm_model():
     """Load the same KaLM model used to create the stored embeddings."""
     from sentence_transformers import SentenceTransformer
@@ -454,50 +495,87 @@ def load_kalm_model():
 
 @lru_cache(maxsize=1)
 def load_kalm_embeddings():
-    """Load every stored embedding once and keep the matrix on the search device."""
+    """Memory-map embeddings and their sorted page IDs without loading vectors."""
+    if KALM_EMBEDDING_MATRIX_PATH.exists() and KALM_EMBEDDING_PAGE_IDS_PATH.exists():
+        matrix = np.load(KALM_EMBEDDING_MATRIX_PATH, mmap_mode="r")
+        page_ids = np.load(KALM_EMBEDDING_PAGE_IDS_PATH, mmap_mode="r")
+        if matrix.ndim != 2:
+            raise ValueError(
+                f"Expected a 2D embedding matrix, found shape {matrix.shape}"
+            )
+        if page_ids.ndim != 1 or len(page_ids) != len(matrix):
+            raise ValueError(
+                "Embedding page IDs and matrix have incompatible shapes: "
+                f"{page_ids.shape} and {matrix.shape}"
+            )
+        if len(page_ids) > 1 and np.any(page_ids[1:] <= page_ids[:-1]):
+            raise ValueError("Memory-mapped embedding page IDs must be unique and sorted")
+        return matrix, page_ids
+
+    # Compatibility fallback for installations that have not built the
+    # memory-mapped files yet. This retains the former high-memory behavior.
     embedding_files = sorted(KALM_EMBEDDINGS_DIR.glob("embeddings_*.parquet"))
     if not embedding_files:
-        return torch.empty((0, 0), device=kalm_device()), {}
+        return np.empty((0, 0), dtype=np.float32), np.empty(0, dtype=np.int64)
 
     chunks = [pd.read_parquet(path, columns=["page_id", "embedding"])
               for path in embedding_files]
     embeddings = pd.concat(chunks, ignore_index=True)
     matrix = np.vstack(embeddings["embedding"].to_numpy()).astype(np.float32)
-    page_ids = embeddings["page_id"].tolist()
-    page_to_row = {page_id: row for row, page_id in enumerate(page_ids)}
-    return torch.from_numpy(matrix).to(kalm_device()), page_to_row
+    page_ids = embeddings["page_id"].to_numpy(dtype=np.int64, copy=True)
+    order = np.argsort(page_ids, kind="stable")
+    return matrix[order], page_ids[order]
 
 
 @lru_cache(maxsize=16)
 def kalm_scores(location_name: str, target_page_ids=None) -> pd.Series:
     """Return cosine similarity to each stored first-paragraph embedding."""
-    embedding_matrix, page_to_row = load_kalm_embeddings()
-    if not page_to_row:
+    embedding_matrix, embedding_page_ids = load_kalm_embeddings()
+    if len(embedding_page_ids) == 0:
         return pd.Series(dtype="float32")
 
-    model = load_kalm_model()
-    query_embedding = model.encode(
-        [location_name],
-        normalize_embeddings=True,
-        show_progress_bar=False,
-    )[0].astype(np.float32)
-    query = torch.from_numpy(query_embedding).to(embedding_matrix.device)
+    query_embedding = precomputed_city_embedding(location_name)
+    if query_embedding is None:
+        model = load_kalm_model()
+        query_embedding = model.encode(
+            [location_name],
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        )[0].astype(np.float32)
+    if query_embedding.shape != (embedding_matrix.shape[1],):
+        raise ValueError(
+            "Query and article embedding dimensions do not match: "
+            f"{query_embedding.shape} and {embedding_matrix.shape}"
+        )
+    device = kalm_device()
+    query = torch.from_numpy(query_embedding).to(device)
 
     if target_page_ids is None:
-        rows = list(range(len(page_to_row)))
-        selected_page_ids = list(page_to_row)
+        rows = np.arange(len(embedding_page_ids), dtype=np.int64)
+        selected_page_ids = np.asarray(embedding_page_ids)
     else:
-        selected_page_ids = [page_id for page_id in target_page_ids if page_id in page_to_row]
-        rows = [page_to_row[page_id] for page_id in selected_page_ids]
-    if not rows:
+        requested_page_ids = np.fromiter(target_page_ids, dtype=np.int64)
+        rows = np.searchsorted(embedding_page_ids, requested_page_ids)
+        valid = rows < len(embedding_page_ids)
+        valid[valid] &= embedding_page_ids[rows[valid]] == requested_page_ids[valid]
+        rows = rows[valid]
+        selected_page_ids = requested_page_ids[valid]
+    if len(rows) == 0:
         return pd.Series(dtype="float32")
 
-    # Score only the candidate rows. The previous implementation multiplied
-    # the query by the entire embedding matrix before discarding almost all
-    # scores, which is particularly expensive on MPS for a large corpus.
-    selected_scores = (embedding_matrix[rows] @ query).detach().cpu().numpy()
+    # Fancy indexing materializes only selected rows from the memory map. The
+    # complete 1.5 GiB matrix remains on disk instead of being uploaded to MPS.
+    candidate_matrix = np.array(
+        embedding_matrix[rows],
+        dtype=np.float32,
+        order="C",
+        copy=True,
+    )
+    candidate_tensor = torch.from_numpy(candidate_matrix).to(device)
+    with torch.inference_mode():
+        selected_scores = (candidate_tensor @ query).cpu().numpy()
     return pd.Series(
-        dict(zip(selected_page_ids, selected_scores.astype(float))),
+        dict(zip(selected_page_ids.tolist(), selected_scores.astype(float))),
         dtype="float32",
     )
 
@@ -520,37 +598,6 @@ def normalize_scores(values: pd.Series) -> pd.Series:
 def city_core(location_name: str) -> str:
     """Use the city portion before an optional state/country qualifier."""
     return location_name.split(",", 1)[0].strip()
-
-
-CITATION_MARKERS = (
-    r"\b(?:press|publisher|publishing|university press|journal|"
-    r"vol\.?|volume|pp?\.?|pages|isbn|doi|retrieved|accessed)\b"
-)
-
-
-def citation_context_count(text: str, location_pattern) -> int:
-    """Count city mentions occurring in citation-like sentence contexts."""
-    if text is None or pd.isna(text):
-        text = ""
-    citation_count = 0
-    sentences = re.split(r"(?<=[.!?])\s+|\n+", str(text))
-
-    for sentence in sentences:
-        if not location_pattern.search(sentence):
-            continue
-
-        marker_count = len(re.findall(CITATION_MARKERS, sentence, re.IGNORECASE))
-        has_year = bool(re.search(r"\b(?:18|19|20)\d{2}\b", sentence))
-        has_bibliographic_shape = bool(
-            re.search(r":[^.!?]{0,120},\s*(?:18|19|20)\d{2}\b", sentence)
-        )
-
-        # Require multiple signals unless the sentence has the characteristic
-        # publisher/location/year shape, reducing false penalties in prose.
-        if (marker_count >= 2 and has_year) or has_bibliographic_shape:
-            citation_count += 1
-
-    return citation_count
 
 
 # ── Main search ───────────────────────────────────────────────────────────────
@@ -584,21 +631,14 @@ def search_local_history(
             axis=1,
         )
 
-    bm25_retriever, bm25_page_ids = load_bm25_index()
-    query_tokens = bm25s.tokenize([location_name])
-    query_terms = list(query_tokens.vocab.keys())
-    bm25_scores = (
-        bm25_retriever.get_scores(query_terms)
-        if query_terms
-        else np.zeros(len(bm25_page_ids), dtype=np.float32)
-    )
-
-    # Compute corpus-level BM25 scores without sorting every document. We
-    # later retain these scores only for exact city-phrase candidates.
-    score_by_page_id = dict(
-        zip(bm25_page_ids, np.asarray(bm25_scores).astype(float))
-    )
-    df["bm25_score"] = df["page_id"].map(score_by_page_id).fillna(0.0)
+    # SQLite FTS5 computes BM25 while retrieving phrase-matched candidates.
+    # Older/custom DataFrames and the DuckDB fallback receive a neutral score.
+    if "bm25_score" not in df.columns:
+        df["bm25_score"] = 0.0
+    else:
+        df["bm25_score"] = pd.to_numeric(
+            df["bm25_score"], errors="coerce"
+        ).fillna(0.0)
 
     # Exact phrase evidence. A qualifier such as ", MI" or ", Michigan" is
     # ignored for matching, so both queries use the core phrase "Ann Arbor".
@@ -630,10 +670,19 @@ def search_local_history(
         location_pattern, na=False
     )
     exact_city_match = df["exact_title_match"] | df["exact_full_text_match"]
+    citation_counts = load_citation_counts(location_name)
     df["citation_context_count"] = 0
-    df.loc[exact_city_match, "citation_context_count"] = df.loc[
-        exact_city_match, "full_text"
-    ].apply(lambda text: citation_context_count(text, location_pattern))
+    if citation_counts is None:
+        df.loc[exact_city_match, "citation_context_count"] = df.loc[
+            exact_city_match, "full_text"
+        ].apply(lambda text: citation_context_count(text, location_pattern))
+    else:
+        df.loc[exact_city_match, "citation_context_count"] = (
+            df.loc[exact_city_match, "page_id"]
+            .map(citation_counts)
+            .fillna(0)
+            .astype("int8")
+        )
     # Citation context is a weak negative signal, not a per-reference
     # subtraction. Strong title/lead evidence means the article is topical,
     # even if it contains many ordinary bibliographic references.

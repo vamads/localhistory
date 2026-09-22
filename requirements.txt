@@ -1,10 +1,9 @@
 pandas
 numpy
 pyarrow
-duckdb
 requests
 pyspark
-bm25s
 sentence-transformers
 torch
 transformers==4.45.2
+geonamescache==3.0.2

@@ -49,10 +49,13 @@ ARTICLE_COLUMNS = """
     articles.page_id,
     articles.title,
     articles.first_paragraph,
+    length(articles.first_paragraph) AS first_paragraph_length,
+    length(articles.full_text) AS full_text_length,
     articles.is_list_article,
     articles.lat,
     articles.lon,
     articles.country,
+    articles.wikidata_id,
     articles.hop,
     articles.year,
     articles.entity_class
@@ -383,6 +386,43 @@ def place_occurrence_features(
     return frame
 
 
+def article_quality_features(frame: pd.DataFrame) -> pd.DataFrame:
+    """Build modest quality signals from article shape and metadata."""
+    first_length = pd.to_numeric(
+        frame.get("first_paragraph_length", frame["first_paragraph"].str.len()),
+        errors="coerce",
+    ).fillna(0)
+    full_length = pd.to_numeric(
+        frame.get("full_text_length", first_length),
+        errors="coerce",
+    ).fillna(0)
+    recognized_type = frame["entity_class"].ne("other").astype(float)
+    metadata_fields = ["wikidata_id", "country", "year", "lat", "lon"]
+    metadata_score = sum(
+        frame[field].notna().astype(float)
+        for field in metadata_fields
+        if field in frame
+    )
+    stub_like = (first_length < 160) & (full_length < 800)
+    substantive_lead = (first_length >= 240).astype(float)
+    incidental_mention = (
+        frame["exact_full_text_match"]
+        & ~frame["exact_title_match"]
+        & ~frame["lead_exact_match"]
+    )
+
+    frame["quality_score"] = (
+        -5.0 * frame["is_list_article"].astype(float)
+        -2.5 * stub_like.astype(float)
+        -1.5 * incidental_mention.astype(float)
+        +0.75 * recognized_type
+        +0.2 * metadata_score
+        +1.0 * substantive_lead
+        -0.75 * (first_length < 80).astype(float)
+    )
+    return frame
+
+
 # ── Main search ───────────────────────────────────────────────────────────────
 
 
@@ -407,6 +447,7 @@ def search_local_history(
     df = index.copy()
 
     df = place_occurrence_features(df, location_name)
+    df = article_quality_features(df)
 
     df["bm25_score"] = pd.to_numeric(
         df["bm25_score"], errors="coerce"
@@ -518,11 +559,7 @@ def search_local_history(
         0.5 * (1 - combined["distance_km"] / max(radius_km, 1.0))
     ).clip(lower=0).fillna(0)
     score += ((5 - combined["hop"]) * 2).fillna(0)
-    score += combined["entity_class"].map(
-        {"event": 4, "place": 3, "person": 2, "work": 1, "organization": 2}
-    ).fillna(0)
-    score += 2 * combined["year"].notna()
-    score -= 5 * combined["is_list_article"].astype(float)
+    score += combined["quality_score"]
     combined["score"] = score
 
     # Coordinates are a hard inclusion rule, not a ranking rule. Keep every

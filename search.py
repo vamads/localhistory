@@ -10,6 +10,7 @@ Hybrid local history search combining:
 
 import math
 import os
+import re
 import sqlite3
 import pandas as pd
 import numpy as np
@@ -354,6 +355,34 @@ def normalize_scores(values: pd.Series) -> pd.Series:
     return (values - minimum) / (maximum - minimum)
 
 
+def place_occurrence_features(
+    frame: pd.DataFrame,
+    location_name: str,
+) -> pd.DataFrame:
+    """Score where and how often the city appears in title and lead text."""
+    city = location_name.split(",", 1)[0].strip().casefold()
+    if not city:
+        frame["place_title_mentions"] = 0
+        frame["place_lead_mentions"] = 0
+        frame["place_position_score"] = 0.0
+        return frame
+
+    pattern = re.compile(rf"(?<!\w){re.escape(city)}(?!\w)")
+    titles = frame["title"].fillna("").astype(str).str.casefold()
+    leads = frame["first_paragraph"].fillna("").astype(str).str.casefold()
+    frame["place_title_mentions"] = titles.str.count(pattern)
+    frame["place_lead_mentions"] = leads.str.count(pattern)
+
+    def first_position(value: str) -> float:
+        match = pattern.search(value)
+        if match is None:
+            return 0.0
+        return 1.0 - (match.start() / max(len(value), 1))
+
+    frame["place_position_score"] = leads.map(first_position)
+    return frame
+
+
 # ── Main search ───────────────────────────────────────────────────────────────
 
 
@@ -376,6 +405,8 @@ def search_local_history(
         )
 
     df = index.copy()
+
+    df = place_occurrence_features(df, location_name)
 
     df["bm25_score"] = pd.to_numeric(
         df["bm25_score"], errors="coerce"
@@ -472,7 +503,20 @@ def search_local_history(
     score -= combined["citation_penalty"]
     score += 5 * combined["bm25_score_normalized"]
     score += 2 * combined["kalm_score_normalized"]
-    score += (20 - combined["distance_km"] * 0.4).clip(lower=0).fillna(0)
+    score += (
+        8 * combined["place_title_mentions"]
+        + 5 * combined["place_lead_mentions"]
+        + 2 * np.log1p(
+            combined["place_title_mentions"]
+            + combined["place_lead_mentions"]
+        )
+        + 4 * combined["place_position_score"]
+    )
+    # Geography is context, not relevance. Keep it as a small tie-breaker so
+    # a strong text match can outrank a weak coordinate-only match.
+    score += (
+        0.5 * (1 - combined["distance_km"] / max(radius_km, 1.0))
+    ).clip(lower=0).fillna(0)
     score += ((5 - combined["hop"]) * 2).fillna(0)
     score += combined["entity_class"].map(
         {"event": 4, "place": 3, "person": 2, "work": 1, "organization": 2}
@@ -480,7 +524,19 @@ def search_local_history(
     score += 2 * combined["year"].notna()
     score -= 5 * combined["is_list_article"].astype(float)
     combined["score"] = score
-    results = combined.sort_values("score", ascending=False).head(top_n)
+
+    # Coordinates are a hard inclusion rule, not a ranking rule. Keep every
+    # coordinate-backed result, add the best text-only results, and then rank
+    # the combined set by the same text-led score.
+    coordinate_results = combined[combined["distance_km"].notna()]
+    text_results = combined[combined["distance_km"].isna()].nlargest(
+        top_n,
+        "score",
+    )
+    results = pd.concat(
+        [coordinate_results, text_results.head(top_n)],
+        ignore_index=True,
+    ).sort_values("score", ascending=False)
 
     return {
         "results": results,

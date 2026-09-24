@@ -5,8 +5,8 @@ Examples:
     python profile_search.py --query Detroit --lat 42.3314 --lon -83.0458 --repeats 5
     python profile_search.py --query "Ann Arbor" --profile-output search.prof
 
-The first measured search includes lazy BM25/model/embedding loading. Later
-searches measure the warm path with those resources cached in the process.
+The first measured search includes memory-map initialization. Later searches
+measure the warm path with those resources cached in the process.
 Geocoding is intentionally excluded; coordinates are supplied on the command
 line so the results reflect search performance rather than network latency.
 """
@@ -25,10 +25,10 @@ from pathlib import Path
 import pandas as pd
 
 from search import (
-    INDEX_PATH,
+    SQLITE_SEARCH_PATH,
     kalm_device,
-    load_bm25_index,
     load_candidate_index,
+    load_citation_counts,
     load_kalm_embeddings,
     load_kalm_model,
     search_local_history,
@@ -93,8 +93,6 @@ def run_search(args: argparse.Namespace, index: pd.DataFrame) -> dict:
         top_n=args.top_n,
         bm25_min_score=1.0,
         kalm_top_k=200,
-        worst_n=0,
-        fallback_top_n=0,
         index=index,
     )
     sync_device()
@@ -116,10 +114,10 @@ def main() -> None:
     parser.add_argument("--profile-output", type=Path, default=None)
     args = parser.parse_args()
 
-    print(f"Index: {INDEX_PATH}")
+    print(f"Index: {SQLITE_SEARCH_PATH}")
     print(f"Query: {args.query!r} ({args.lat}, {args.lon}), radius={args.radius} km")
-    print("Loading matching article candidates with DuckDB...")
-    index = load_candidate_index(args.query)
+    print("Loading matching article candidates...")
+    index = load_candidate_index(args.query, args.lat, args.lon, args.radius)
     print(f"Candidate articles: {len(index):,}")
     print(f"Initial RSS: {format_bytes(rss_bytes())}")
 
@@ -158,7 +156,8 @@ def main() -> None:
 
     print("\nCache sizes")
     for name, function in (
-        ("BM25", load_bm25_index),
+        ("Candidate index", load_candidate_index),
+        ("Citation index", load_citation_counts),
         ("KaLM model", load_kalm_model),
         ("KaLM embeddings", load_kalm_embeddings),
     ):

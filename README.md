@@ -6,6 +6,8 @@ Turns Wikipedia and Wikidata into an explorable graph of historical events and p
 - `search.py` contains the local-history search and ranking logic.
 - `preprocessing/` contains the scripts that build the search index from Wikipedia
   and Wikidata data.
+- `notebooks/explore_wikipedia_links.ipynb` inspects the Wikipedia page/link dumps
+  and prototypes incoming-link importance features.
 - `data/` is local-only and is excluded from Git. It contains raw dumps,
   checkpoints, and generated Parquet files.
 
@@ -32,12 +34,32 @@ python preprocessing/02_extract_wikipedia.py
 python preprocessing/03_fetch_wikidata_metadata.py
 python preprocessing/04_build_search_index.py
 python preprocessing/05_build_sqlite_search.py
+python preprocessing/06_build_embedding_memmap.py
+python preprocessing/07_build_city_query_embeddings.py
+python preprocessing/08_build_citation_index.py
 ```
 
 Script 04 writes `local_history_index.parquet`. Script 05 streams that Parquet
 file into `local_history_search.sqlite` and builds a persistent SQLite FTS5
-phrase index. Search uses SQLite when the database exists and is newer than the
-Parquet source, otherwise it falls back to the slower DuckDB literal scan.
+phrase index. FTS5 supplies both candidate retrieval and weighted BM25 ranking
+across title, first paragraph, and full text. The SQLite indexes are required
+at runtime; search reports the appropriate rebuild command if one is missing
+or stale. Article details and map coordinates are also read from this database,
+so the web API does not load the Parquet article index at runtime.
+Candidate retrieval unions two independent groups: every article inside the
+coordinate radius, and articles containing an exact qualified-place phrase
+such as `"Jackson Michigan"` or `"Jackson MI"`. Bare city-word and full-text
+proximity matches are intentionally excluded to avoid namesake false positives.
+Script 06 converts the embedding checkpoints into a sorted NumPy memory map.
+Search then reads only vectors belonging to the FTS candidates rather than
+loading the complete embedding matrix into RAM and accelerator memory.
+Script 07 builds a local GeoNames city/alias resolver and precomputes one KaLM
+query vector per city. Recognized city searches then avoid both the Nominatim
+request and loading KaLM at runtime. The city data is provided by GeoNames
+under CC BY 4.0: https://www.geonames.org/
+Script 08 extracts only citation-like sentences into a separate SQLite FTS5
+index. Search can then look up citation-context matches by city phrase without
+scanning or splitting candidate article text at runtime.
 
 ## Profile search performance
 

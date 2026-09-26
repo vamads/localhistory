@@ -44,6 +44,7 @@ SQLITE_SEARCH_PATH = DATA_DIR / "local_history_search.sqlite"
 CITATION_INDEX_PATH = DATA_DIR / "local_history_citations.sqlite"
 KALM_EMBEDDING_MATRIX_PATH = DATA_DIR / "kalm_embeddings.npy"
 KALM_EMBEDDING_PAGE_IDS_PATH = DATA_DIR / "kalm_embedding_page_ids.npy"
+LINK_COUNTS_PATH = DATA_DIR / "article_link_counts.parquet"
 KALM_MODEL_NAME = "KaLM-Embedding/KaLM-embedding-multilingual-mini-instruct-v2.5"
 ARTICLE_COLUMNS = """
     articles.page_id,
@@ -100,6 +101,41 @@ def require_current_index(path: Path, source: Path, build_command: str) -> None:
         raise FileNotFoundError(f"Missing search index: {path}\nRun: {build_command}")
     if source.exists() and path.stat().st_mtime < source.stat().st_mtime:
         raise RuntimeError(f"Stale search index: {path}\nRun: {build_command}")
+
+
+@lru_cache(maxsize=1)
+def load_editorial_importance() -> pd.Series:
+    """Load capped log incoming-link scores for optional secondary ranking.
+
+    The link-count job scans all normal Wikipedia article links but stores
+    only Local History targets. Missing link data is treated as a zero score
+    so search remains usable while the one-time preprocessing job is running.
+    """
+    if not LINK_COUNTS_PATH.exists():
+        return pd.Series(dtype="float64", name="editorial_importance")
+
+    counts = pd.read_parquet(
+        LINK_COUNTS_PATH,
+        columns=["page_id", "incoming_link_count"],
+    )
+    counts["page_id"] = pd.to_numeric(counts["page_id"], errors="coerce")
+    counts["incoming_link_count"] = pd.to_numeric(
+        counts["incoming_link_count"], errors="coerce"
+    ).fillna(0.0).clip(lower=0.0)
+    counts = counts.dropna(subset=["page_id"]).drop_duplicates("page_id")
+
+    log_counts = np.log1p(counts["incoming_link_count"].to_numpy(dtype="float64"))
+    cap = float(np.quantile(log_counts, 0.99)) if len(log_counts) else 0.0
+    if cap <= 0.0:
+        scores = np.zeros(len(counts), dtype="float64")
+    else:
+        scores = np.clip(log_counts / cap, 0.0, 1.0)
+
+    return pd.Series(
+        scores,
+        index=counts["page_id"].astype("int64").to_numpy(),
+        name="editorial_importance",
+    )
 
 
 def quote_fts_phrase(value: str) -> str:
@@ -540,6 +576,14 @@ def search_local_history(
         subset="page_id", keep="first"
     )
 
+    # Incoming Wikipedia links are a secondary editorial-prominence signal.
+    # Local retrieval has already defined the candidate set; this only helps
+    # order relevant candidates and cannot introduce globally popular pages.
+    editorial_importance = load_editorial_importance()
+    combined["editorial_importance"] = (
+        combined["page_id"].map(editorial_importance).fillna(0.0)
+    )
+
     score = combined["exact_score"].astype(float)
     score -= combined["citation_penalty"]
     score += 5 * combined["bm25_score_normalized"]
@@ -560,6 +604,7 @@ def search_local_history(
     ).clip(lower=0).fillna(0)
     score += ((5 - combined["hop"]) * 2).fillna(0)
     score += combined["quality_score"]
+    score += 0.25 * combined["editorial_importance"]
     combined["score"] = score
 
     # Coordinates are a hard inclusion rule, not a ranking rule. Keep every

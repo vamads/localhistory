@@ -37,6 +37,7 @@ python preprocessing/05_build_sqlite_search.py
 python preprocessing/06_build_embedding_memmap.py
 python preprocessing/07_build_city_query_embeddings.py
 python preprocessing/08_build_citation_index.py
+python preprocessing/09_build_link_counts.py
 ```
 
 Script 04 writes `local_history_index.parquet`. Script 05 streams that Parquet
@@ -60,6 +61,16 @@ under CC BY 4.0: https://www.geonames.org/
 Script 08 extracts only citation-like sentences into a separate SQLite FTS5
 index. Search can then look up citation-context matches by city phrase without
 scanning or splitting candidate article text at runtime.
+Script 09 is a one-time link-data job. It counts links from all normal
+Wikipedia articles to normal Wikipedia articles, then writes only Local
+History targets to `article_link_counts.parquet`. It also writes metadata to
+`article_link_counts.json`; neither output is required until link importance
+is added to the runtime ranking.
+
+When `article_link_counts.parquet` is present, search loads its incoming-link
+counts once, applies `log1p`, caps them at the 99th percentile, and adds a small
+editorial-prominence bonus to already-retrieved candidates. Link data does not
+create candidates or override local text, quality, and geographic relevance.
 
 ## Profile search performance
 

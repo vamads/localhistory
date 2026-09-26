@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "localhistory"
+version = "0.1.0"
+description = "Search and explore historical places, people, and events from Wikipedia and Wikidata."
+requires-python = ">=3.10"
+dependencies = [
+    "geonamescache==3.0.2",
+    "numpy",
+    "pandas",
+    "pyarrow",
+    "requests",
+    "sentence-transformers",
+    "torch",
+    "transformers==4.45.2",
+]
+
+[project.optional-dependencies]
+api = [
+    "fastapi==0.115.12",
+    "uvicorn[standard]==0.34.2",
+]
+data = [
+    "pyspark",
+]
+dev = [
+    "jupyter",
+    "pytest",
+]
+
+[tool.setuptools]
+packages = ["localhistory"]
+package-dir = {localhistory = "."}

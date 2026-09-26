@@ -1,12 +1,15 @@
 import pandas as pd
 import numpy as np
 import torch
+import os
 from pathlib import Path
 from sentence_transformers import SentenceTransformer
 import time
 
 # ── Config ────────────────────────────────────────────────────────────────────
-BASE = Path("/Users/vicenteamado/Documents/LLM/history_ML/data")
+BASE = Path(
+    os.getenv("LOCAL_HISTORY_DATA_DIR", str(Path(__file__).resolve().parents[3] / "data"))
+).expanduser().resolve()
 OUT_DIR = BASE / "kalm_first_paragraph_embeddings"
 OUT_DIR.mkdir(exist_ok=True)
 BATCH_SIZE = 64  # articles per encode() call

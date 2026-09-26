@@ -1,4 +1,4 @@
-import type { ArticleDetail, SearchResponse } from "./types";
+import type { ArticleDetail, MapPoint, SearchResponse } from "./types";
 
 const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
 
@@ -21,4 +21,8 @@ export function searchHistory(query: string, radiusKm: number) {
 
 export function fetchArticle(pageId: number) {
   return request<ArticleDetail>("/api/articles/" + pageId);
+}
+
+export function fetchCoordinates() {
+  return request<MapPoint[]>("/api/coordinates");
 }

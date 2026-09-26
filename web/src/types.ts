@@ -24,6 +24,12 @@ export type SearchResponse = {
   counts: { mapped: number; connected: number };
 };
 
+export type MapPoint = {
+  page_id: number;
+  latitude: number;
+  longitude: number;
+};
+
 export type ArticleDetail = {
   page_id: number;
   title: string;

@@ -1,6 +1,6 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import workerUrl from "maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url";
-import type { ArticleCard } from "./types";
+import type { MapPoint } from "./types";
 import type {
   GeoJSONSource,
   Map as MapLibreMap,
@@ -9,8 +9,9 @@ import type {
 
 type Props = {
   center: [number, number];
-  articles: ArticleCard[];
-  onSelect: (article: ArticleCard) => void;
+  points: MapPoint[];
+  radiusKm: number;
+  onSelect: (pageId: number) => void;
 };
 
 const mapStyle: StyleSpecification = {
@@ -26,30 +27,44 @@ const mapStyle: StyleSpecification = {
   layers: [{ id: "osm", type: "raster", source: "osm" }],
 };
 
-function articleGeoJson(articles: ArticleCard[]) {
+function distanceKm(center: [number, number], point: MapPoint) {
+  const [lon1, lat1] = center;
+  const radians = Math.PI / 180;
+  const dLat = (point.latitude - lat1) * radians;
+  const dLon = (point.longitude - lon1) * radians;
+  const a = Math.sin(dLat / 2) ** 2
+    + Math.cos(lat1 * radians)
+      * Math.cos(point.latitude * radians)
+      * Math.sin(dLon / 2) ** 2;
+  return 6371 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+function articleGeoJson(points: MapPoint[]) {
   return {
     type: "FeatureCollection" as const,
-    features: articles
-      .filter((article) => article.latitude !== null && article.longitude !== null)
-      .map((article) => ({
+    features: points.map((point) => ({
         type: "Feature" as const,
         geometry: {
           type: "Point" as const,
-          coordinates: [article.longitude!, article.latitude!],
+          coordinates: [point.longitude, point.latitude],
         },
         properties: {
-          page_id: article.page_id,
-          title: article.title,
-          entity_class: article.entity_class,
+          page_id: point.page_id,
         },
       })),
   };
 }
 
-export default function MapView({ center, articles, onSelect }: Props) {
+export default function MapView({ center, points, radiusKm, onSelect }: Props) {
   const container = useRef<HTMLDivElement>(null);
   const map = useRef<MapLibreMap | null>(null);
   const onSelectRef = useRef(onSelect);
+
+  const [centerLon, centerLat] = center;
+  const visiblePoints = useMemo(
+    () => points.filter((point) => distanceKm([centerLon, centerLat], point) <= radiusKm),
+    [centerLon, centerLat, points, radiusKm],
+  );
 
   onSelectRef.current = onSelect;
 
@@ -77,7 +92,7 @@ export default function MapView({ center, articles, onSelect }: Props) {
       instance.on("load", () => {
         instance.addSource("articles", {
           type: "geojson",
-          data: articleGeoJson(articles),
+          data: articleGeoJson(visiblePoints),
           cluster: true,
           clusterMaxZoom: 14,
           clusterRadius: 44,
@@ -133,8 +148,7 @@ export default function MapView({ center, articles, onSelect }: Props) {
 
         instance.on("click", "article-points", (event) => {
           const pageId = Number(event.features?.[0]?.properties?.page_id);
-          const article = articles.find((item) => item.page_id === pageId);
-          if (article) onSelectRef.current(article);
+          if (Number.isFinite(pageId)) onSelectRef.current(pageId);
         });
 
         for (const layer of ["clusters", "article-points"]) {
@@ -153,7 +167,7 @@ export default function MapView({ center, articles, onSelect }: Props) {
       map.current?.remove();
       map.current = null;
     };
-  }, [articles, center[0], center[1]]);
+  }, [visiblePoints, center[0], center[1]]);
 
   return <div className="map" ref={container} aria-label="Map of article locations" />;
 }

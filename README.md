@@ -3,9 +3,10 @@ Turns Wikipedia and Wikidata into an explorable graph of historical events and p
 
 ## Project layout
 
-- `search.py` contains the local-history search and ranking logic.
+- `src/localhistory/` contains the API, search, ranking, and runtime helpers.
 - `preprocessing/` contains the scripts that build the search index from Wikipedia
   and Wikidata data.
+- `scripts/` contains profiling and diagnostic commands.
 - `notebooks/explore_wikipedia_links.ipynb` inspects the Wikipedia page/link dumps
   and prototypes incoming-link importance features.
 - `data/` is local-only and is excluded from Git. It contains raw dumps,
@@ -14,7 +15,13 @@ Turns Wikipedia and Wikidata into an explorable graph of historical events and p
 ## Setup
 
 ```bash
-pip install -r requirements.txt
+pip install -e ".[api,data,dev]"
+```
+
+For an API-only environment, install the smaller group:
+
+```bash
+pip install -e ".[api]"
 ```
 
 By default, scripts look for `data/` inside this repository. To use a different
@@ -78,8 +85,8 @@ Run the profiler with fixed coordinates to measure cold-start and warm-search
 latency without including geocoding network time:
 
 ```bash
-python profile_search.py
-python profile_search.py --query Detroit --lat 42.3314 --lon -83.0458 --repeats 5
+python scripts/profile_search.py
+python scripts/profile_search.py --query Detroit --lat 42.3314 --lon -83.0458 --repeats 5
 ```
 
 The report includes cProfile hotspots, Python allocation peaks, process RSS,
@@ -92,10 +99,10 @@ Measure server launch, the first HTTP search, and repeated warm searches using
 the same endpoint as the frontend:
 
 ```bash
-python localhistory/profile_api.py
-python localhistory/profile_api.py --query Detroit --repeats 5
+python scripts/profile_api.py
+python scripts/profile_api.py --query Detroit --repeats 5
 ```
 
-Run this from the `history_ML` repository root. The API also returns a
+Run this from the `localhistory` repository root. The API also returns a
 `Server-Timing` header that separates geocoding, search, serialization, and
 total request time; it is visible on `/api/search` in browser developer tools.

@@ -31,6 +31,5 @@ dev = [
     "pytest",
 ]
 
-[tool.setuptools]
-packages = ["localhistory"]
-package-dir = {localhistory = "."}
+[tool.setuptools.packages.find]
+where = ["src"]

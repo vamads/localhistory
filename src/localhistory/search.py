@@ -22,8 +22,8 @@ try:
     from .city_queries import precomputed_city_embedding, resolve_city_query
     from .citation_index import CITATION_HEURISTIC_VERSION
 except ImportError:  # Support running search.py/profile_search.py as scripts.
-    from city_queries import precomputed_city_embedding, resolve_city_query
-    from citation_index import CITATION_HEURISTIC_VERSION
+    from localhistory.city_queries import precomputed_city_embedding, resolve_city_query
+    from localhistory.citation_index import CITATION_HEURISTIC_VERSION
 
 def resolve_data_dir() -> Path:
     """Return the data directory, allowing local or deployed configuration."""
@@ -32,7 +32,8 @@ def resolve_data_dir() -> Path:
         return Path(configured).expanduser().resolve()
 
     candidates = [
-        Path(__file__).resolve().parent.parent / "data",
+        Path(__file__).resolve().parents[3] / "data",
+        Path(__file__).resolve().parents[2] / "data",
         Path(__file__).resolve().parent / "data",
     ]
     return next((path for path in candidates if path.exists()), candidates[0])

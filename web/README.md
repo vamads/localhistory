@@ -7,7 +7,7 @@ coordinates appear on the map; text-linked articles remain in the Connected rail
 
 From the `history_ML` directory, install and start the API:
 
-    pip install -r localhistory/requirements.txt -r localhistory/api_requirements.txt
+    pip install -e "localhistory[api]"
     python -m uvicorn localhistory.api:app --reload --port 8000
 
 In a second terminal:
@@ -24,4 +24,4 @@ Open `http://localhost:5173`. To use another API address, copy `.env.example` to
 - `src/App.tsx` owns search and view state.
 - `src/MapView.tsx` owns MapLibre and marker clustering.
 - `src/api.ts` is the complete API client.
-- `../api.py` adapts the existing search output for the browser.
+- `../src/localhistory/api.py` adapts the existing search output for the browser.

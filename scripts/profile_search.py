@@ -1,9 +1,9 @@
 """Profile local-history search speed and memory usage.
 
 Examples:
-    python profile_search.py
-    python profile_search.py --query Detroit --lat 42.3314 --lon -83.0458 --repeats 5
-    python profile_search.py --query "Ann Arbor" --profile-output search.prof
+    python scripts/profile_search.py
+    python scripts/profile_search.py --query Detroit --lat 42.3314 --lon -83.0458 --repeats 5
+    python scripts/profile_search.py --query "Ann Arbor" --profile-output search.prof
 
 The first measured search includes memory-map initialization. Later searches
 measure the warm path with those resources cached in the process.
@@ -24,7 +24,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from search import (
+from localhistory.search import (
     SQLITE_SEARCH_PATH,
     kalm_device,
     load_candidate_index,

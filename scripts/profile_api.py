@@ -2,8 +2,8 @@
 
 Run from the history_ML repository root:
 
-    python localhistory/profile_api.py
-    python localhistory/profile_api.py --query Detroit --repeats 5
+    python scripts/profile_api.py
+    python scripts/profile_api.py --query Detroit --repeats 5
 """
 
 import argparse

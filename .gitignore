@@ -20,3 +20,10 @@ categories_by_hop.txt
 .env
 .env.*
 *.log
+
+# Frontend build and TypeScript compiler artifacts
+web/node_modules/
+web/dist/
+web/.vite/
+*.tsbuildinfo
+web/vite.config.d.ts

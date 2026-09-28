@@ -41,8 +41,16 @@ def resolve_data_dir() -> Path:
 
 DATA_DIR = resolve_data_dir()
 INDEX_PATH = DATA_DIR / "local_history_index.parquet"
-SQLITE_SEARCH_PATH = DATA_DIR / "local_history_search.sqlite"
-CITATION_INDEX_PATH = DATA_DIR / "local_history_citations.sqlite"
+BASE_SEARCH_PATH = DATA_DIR / "local_history_search.sqlite"
+RUNTIME_DATABASE_PATH = DATA_DIR / "local_history_runtime.sqlite"
+SQLITE_SEARCH_PATH = (
+    RUNTIME_DATABASE_PATH if RUNTIME_DATABASE_PATH.exists() else BASE_SEARCH_PATH
+)
+CITATION_INDEX_PATH = (
+    SQLITE_SEARCH_PATH
+    if SQLITE_SEARCH_PATH == RUNTIME_DATABASE_PATH
+    else DATA_DIR / "local_history_citations.sqlite"
+)
 KALM_EMBEDDING_MATRIX_PATH = DATA_DIR / "kalm_embeddings.npy"
 KALM_EMBEDDING_PAGE_IDS_PATH = DATA_DIR / "kalm_embedding_page_ids.npy"
 LINK_COUNTS_PATH = DATA_DIR / "article_link_counts.parquet"
@@ -100,6 +108,10 @@ def load_candidate_index(
 def require_current_index(path: Path, source: Path, build_command: str) -> None:
     if not path.exists():
         raise FileNotFoundError(f"Missing search index: {path}\nRun: {build_command}")
+    # The finalized runtime database is an immutable production snapshot. It
+    # intentionally does not require the large Parquet source at query time.
+    if path == RUNTIME_DATABASE_PATH:
+        return
     if source.exists() and path.stat().st_mtime < source.stat().st_mtime:
         raise RuntimeError(f"Stale search index: {path}\nRun: {build_command}")
 
@@ -112,6 +124,20 @@ def load_editorial_importance() -> pd.Series:
     only Local History targets. Missing link data is treated as a zero score
     so search remains usable while the one-time preprocessing job is running.
     """
+    if RUNTIME_DATABASE_PATH.exists():
+        database_uri = f"file:{RUNTIME_DATABASE_PATH}?mode=ro&immutable=1"
+        with sqlite3.connect(database_uri, uri=True) as connection:
+            rows = connection.execute(
+                "SELECT page_id, editorial_importance FROM article_importance"
+            ).fetchall()
+        if not rows:
+            return pd.Series(dtype="float64", name="editorial_importance")
+        return pd.Series(
+            [float(score) for _, score in rows],
+            index=[int(page_id) for page_id, _ in rows],
+            name="editorial_importance",
+        )
+
     if not LINK_COUNTS_PATH.exists():
         return pd.Series(dtype="float64", name="editorial_importance")
 
@@ -192,12 +218,13 @@ def load_citation_counts(location_name: str) -> dict[int, int]:
     with sqlite3.connect(database_uri, uri=True) as connection:
         metadata = dict(connection.execute("SELECT key, value FROM metadata"))
         source_stat = SQLITE_SEARCH_PATH.stat()
-        if (
-            metadata.get("citation_heuristic_version")
-            != CITATION_HEURISTIC_VERSION
-            or metadata.get("source_size") != str(source_stat.st_size)
-            or metadata.get("source_mtime_ns") != str(source_stat.st_mtime_ns)
-        ):
+        stale = metadata.get("citation_heuristic_version") != CITATION_HEURISTIC_VERSION
+        if CITATION_INDEX_PATH != SQLITE_SEARCH_PATH:
+            stale = stale or (
+                metadata.get("source_size") != str(source_stat.st_size)
+                or metadata.get("source_mtime_ns") != str(source_stat.st_mtime_ns)
+            )
+        if stale:
             raise RuntimeError(
                 f"Stale citation index: {CITATION_INDEX_PATH}\n"
                 "Run: python preprocessing/08_build_citation_index.py --overwrite"

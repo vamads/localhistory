@@ -45,6 +45,7 @@ python preprocessing/06_build_embedding_memmap.py
 python preprocessing/07_build_city_query_embeddings.py
 python preprocessing/08_build_citation_index.py
 python preprocessing/09_build_link_counts.py
+python preprocessing/10_build_runtime_database.py
 ```
 
 Script 04 writes `local_history_index.parquet`. Script 05 streams that Parquet
@@ -72,12 +73,21 @@ Script 09 is a one-time link-data job. It counts links from all normal
 Wikipedia articles to normal Wikipedia articles, then writes only Local
 History targets to `article_link_counts.parquet`. It also writes metadata to
 `article_link_counts.json`; neither output is required until link importance
-is added to the runtime ranking.
+is added to the runtime ranking. Script 10 imports those scores into the
+production database.
 
 When `article_link_counts.parquet` is present, search loads its incoming-link
 counts once, applies `log1p`, caps them at the 99th percentile, and adds a small
 editorial-prominence bonus to already-retrieved candidates. Link data does not
 create candidates or override local text, quality, and geographic relevance.
+
+For deployment, script 10 creates `local_history_runtime.sqlite`, which
+contains the article search tables, article FTS index, citation FTS index, and
+article importance scores. The API automatically prefers this finalized
+database when it exists. The raw search database, citation database, link-count
+Parquet file, and large preprocessing artifacts do not need to be deployed.
+The embedding `.npy` files remain separate because they are memory-mapped at
+query time. `runtime_manifest.json` records the production snapshot metadata.
 
 ## Profile search performance
 

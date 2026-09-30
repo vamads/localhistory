@@ -16,7 +16,6 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 from functools import lru_cache
-import torch
 
 try:
     from .city_queries import precomputed_city_embedding, resolve_city_query
@@ -311,26 +310,21 @@ def load_sqlite_coordinate_candidates(
         return pd.read_sql_query(query, connection, params=parameters)
 
 
-def kalm_device() -> str:
-    """Select the fastest available PyTorch device for embedding searches."""
-    configured = os.getenv("LOCAL_HISTORY_EMBEDDING_DEVICE")
-    if configured:
-        return configured
-    if torch.cuda.is_available():
-        return "cuda"
-    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        return "mps"
-    return "cpu"
-
 @lru_cache(maxsize=1)
 def load_kalm_model():
-    """Load the same KaLM model used to create the stored embeddings."""
-    from sentence_transformers import SentenceTransformer
+    """Load KaLM only for the optional non-city query fallback."""
+    try:
+        from sentence_transformers import SentenceTransformer
+    except ImportError as exc:
+        raise RuntimeError(
+            "This query is not a recognized city alias and needs the optional "
+            "semantic dependencies. Install with: pip install -e '.[semantic]'"
+        ) from exc
 
     model = SentenceTransformer(
         KALM_MODEL_NAME,
         trust_remote_code=True,
-        device=kalm_device(),
+        device="cpu",
     )
     model.max_seq_length = 4096
     return model
@@ -384,9 +378,6 @@ def kalm_scores(
             "Query and article embedding dimensions do not match: "
             f"{query_embedding.shape} and {embedding_matrix.shape}"
         )
-    device = kalm_device()
-    query = torch.from_numpy(query_embedding).to(device)
-
     requested_page_ids = np.fromiter(target_page_ids, dtype=np.int64)
     rows = np.searchsorted(embedding_page_ids, requested_page_ids)
     valid = rows < len(embedding_page_ids)
@@ -397,16 +388,16 @@ def kalm_scores(
         return pd.Series(dtype="float32")
 
     # Fancy indexing materializes only selected rows from the memory map. The
-    # complete 1.5 GiB matrix remains on disk instead of being uploaded to MPS.
+    # complete matrix remains on disk instead of being copied into process RAM.
     candidate_matrix = np.array(
         embedding_matrix[rows],
         dtype=np.float32,
         order="C",
         copy=True,
     )
-    candidate_tensor = torch.from_numpy(candidate_matrix).to(device)
-    with torch.inference_mode():
-        selected_scores = (candidate_tensor @ query).cpu().numpy()
+    # Embeddings are normalized at generation time, so the dot product is
+    # cosine similarity. Runtime search deliberately stays NumPy/CPU-only.
+    selected_scores = candidate_matrix @ query_embedding
     return pd.Series(
         dict(zip(selected_page_ids.tolist(), selected_scores.astype(float))),
         dtype="float32",

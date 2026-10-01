@@ -48,9 +48,10 @@ def resolve_data_dir() -> Path:
 
 
 DATA_DIR = resolve_data_dir()
-PAGE_SQL = DATA_DIR / "enwiki-latest-page.sql.gz"
-LINKTARGET_SQL = DATA_DIR / "enwiki-latest-linktarget.sql.gz"
-PAGELINKS_SQL = DATA_DIR / "enwiki-latest-pagelinks.sql.gz"
+WIKIMEDIA_VERSION = os.getenv("WIKIMEDIA_VERSION", "latest")
+PAGE_SQL = DATA_DIR / f"enwiki-{WIKIMEDIA_VERSION}-page.sql.gz"
+LINKTARGET_SQL = DATA_DIR / f"enwiki-{WIKIMEDIA_VERSION}-linktarget.sql.gz"
+PAGELINKS_SQL = DATA_DIR / f"enwiki-{WIKIMEDIA_VERSION}-pagelinks.sql.gz"
 ARTICLE_DATABASE = DATA_DIR / "local_history_search.sqlite"
 OUTPUT_PATH = DATA_DIR / "article_link_counts.parquet"
 METADATA_PATH = DATA_DIR / "article_link_counts.json"

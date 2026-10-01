@@ -49,9 +49,10 @@ def resolve_data_dir() -> Path:
 
 
 DATA_DIR = resolve_data_dir()
-PAGE_SQL = DATA_DIR / "enwiki-latest-page.sql.gz"
-LT_SQL = DATA_DIR / "enwiki-latest-linktarget.sql.gz"
-CL_SQL = DATA_DIR / "enwiki-latest-categorylinks.sql.gz"
+WIKIMEDIA_VERSION = os.getenv("WIKIMEDIA_VERSION", "latest")
+PAGE_SQL = DATA_DIR / f"enwiki-{WIKIMEDIA_VERSION}-page.sql.gz"
+LT_SQL = DATA_DIR / f"enwiki-{WIKIMEDIA_VERSION}-linktarget.sql.gz"
+CL_SQL = DATA_DIR / f"enwiki-{WIKIMEDIA_VERSION}-categorylinks.sql.gz"
 
 SEED     = "History"
 MAX_HOPS = 4          # hops 1-4 = 42,148 categories; hop 5+ is noise

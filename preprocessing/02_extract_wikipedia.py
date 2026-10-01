@@ -53,8 +53,9 @@ def resolve_data_dir() -> Path:
 
 
 DATA_DIR = resolve_data_dir()
+WIKIMEDIA_VERSION = os.getenv("WIKIMEDIA_VERSION", "latest")
 
-XML_PATH = DATA_DIR / "enwiki-latest-pages-articles.xml"  # 108GB decompressed
+XML_PATH = DATA_DIR / f"enwiki-{WIKIMEDIA_VERSION}-pages-articles.xml"  # 108GB decompressed
 FILTER_PATH = DATA_DIR / "article_to_category.parquet"  # built by bfs_from_dumps.py
 
 OUT_ARTICLES = DATA_DIR / "articles.parquet"

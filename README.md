@@ -1,24 +1,56 @@
 # localhistory
-Turns Wikipedia and Wikidata into an explorable graph of historical events and places.
+Turn Wikipedia and Wikidata into explorable data of historical places, people, and events.
 
 ## Project layout
 
 - `src/localhistory/` contains the API, search, ranking, and runtime helpers.
 - `preprocessing/` contains the scripts that build the search index from Wikipedia
   and Wikidata data.
-- `scripts/` contains profiling and diagnostic commands.
-- `notebooks/explore_wikipedia_links.ipynb` inspects the Wikipedia page/link dumps
-  and prototypes incoming-link importance features.
+- `scripts/` contains profiling, diagnostic, and data fetching scripts.
 - `data/` is local-only and is excluded from Git. It contains raw dumps,
   checkpoints, and generated Parquet files.
 
 ## Setup
 
 ```bash
-pip install -e ".[api,data,dev]"
+pip install -e ".[api,dev]"
 ```
 
-For an API-only environment, install the smaller group:
+`uv.lock` pins the complete dependency graph for the project. For reproducible environments, install with `uv` instead of resolving
+the dependencies again:
+
+```bash
+uv sync --frozen --extra api
+```
+
+For the preprocessing environment:
+
+```bash
+uv sync --frozen --extra preprocessing
+```
+
+Regenerate the lock after changing `pyproject.toml` with `uv lock` and commit
+the resulting `uv.lock`.
+
+The inference/API install is intentionally CPU-only: it uses NumPy for the
+small candidate-vector similarity calculation and memory-maps the stored
+embeddings. Recognized city queries use the precomputed city vectors. This makes returning different query searches much faster. 
+
+For preprocessing, including embedding generation and the Wikipedia/Spark
+pipeline, install the separate heavier dependencies (e.g., transformers):
+
+```bash
+pip install -e ".[preprocessing]"
+```
+
+If you need the fallback that generates an embedding for a query that is not
+recognized as a city alias, add the optional model dependencies:
+
+```bash
+pip install -e ".[semantic]"
+```
+
+For an API-only environment, install the smaller environment:
 
 ```bash
 pip install -e ".[api]"
@@ -31,7 +63,57 @@ local data directory, set:
 export LOCAL_HISTORY_DATA_DIR=/path/to/localhistory/data
 ```
 
+## Runtime data contract
+
+The backend/inference deployment needs these five files in
+`LOCAL_HISTORY_DATA_DIR`:
+
+```text
+local_history_runtime.sqlite
+kalm_embeddings.npy
+kalm_embedding_page_ids.npy
+city_queries.sqlite
+city_query_embeddings.npy
+```
+
+`local_history_runtime.sqlite` is the consolidated read-only database created
+by step 10. It contains the article tables, SQLite FTS search index, citation
+index, and editorial-importance scores. The two `kalm_*.npy` files are the
+page-id-sorted article embedding matrix and its aligned page IDs. The two city
+files provide city aliases, coordinates, and precomputed query vectors, so the
+CPU-only runtime does not need KaLM or Torch.
+
+These build-only files do not need to be deployed when the runtime database
+exists:
+
+```text
+articles.parquet
+local_history_index.parquet
+local_history_search.sqlite
+local_history_citations.sqlite
+article_link_counts.parquet
+kalm_first_paragraph_embeddings/
+raw Wikipedia/Wikidata dumps
+```
+
+`runtime_manifest.json` is optional operational metadata and is not read by
+the API.
+
 ## Preprocessing pipeline
+
+Download the dated Wikimedia inputs first. This includes the bulk Wikipedia
+article-content dump (`pages-articles.xml.bz2`), not only the SQL metadata and
+link dumps. URLs, sizes, and checksums are recorded in `source_manifest.json`:
+
+```bash
+scripts/download_wikimedia_dumps.sh 20250901
+export WIKIMEDIA_VERSION=20250901
+```
+
+Use `--version latest` only when a moving input is acceptable. The download
+shell script uses resumable `curl` or `wget` downloads and then invokes the
+Python verifier. The Python script can also be run directly; both expand the
+compressed article XML because the PySpark job consumes the uncompressed file.
 
 Run these scripts in order:
 
@@ -47,6 +129,43 @@ python preprocessing/08_build_citation_index.py
 python preprocessing/09_build_link_counts.py
 python preprocessing/10_build_runtime_database.py
 ```
+
+### Rebuilding from source data
+
+For a complete rebuild, retain the following source inputs in the data
+directory:
+
+```text
+enwiki-{version}-page.sql.gz
+enwiki-{version}-linktarget.sql.gz
+enwiki-{version}-categorylinks.sql.gz
+enwiki-{version}-pagelinks.sql.gz
+enwiki-{version}-pages-articles.xml
+```
+
+The pipeline also calls the Wikidata SPARQL endpoint in step 3 and uses the
+GeoNames data bundled by `geonamescache` in step 7. The intermediate files
+created along the way are `article_to_category.parquet`, `articles.parquet`,
+`article_categories.parquet`, `wikidata_metadata.parquet`,
+`local_history_index.parquet`, `local_history_search.sqlite`,
+`kalm_first_paragraph_embeddings/`, `kalm_embeddings.npy`,
+`kalm_embedding_page_ids.npy`, `city_queries.sqlite`,
+`city_query_embeddings.npy`, `local_history_citations.sqlite`,
+`article_link_counts.parquet`, and finally `local_history_runtime.sqlite`.
+
+For exact or auditable reproduction, record the download dates or dump
+versions, the Wikidata query date, the Python lock file, the KaLM model
+revision, and the generated `runtime_manifest.json`. The scripts currently
+refer to `enwiki-latest` and live Wikidata data, so rerunning them later is a
+logical rebuild but not necessarily a byte-for-byte reconstruction of the
+same corpus.
+
+The main PySpark workload is step 2, `preprocessing/02_extract_wikipedia.py`.
+It parses the full Wikipedia XML dump in a local Spark session, joins against
+`article_to_category.parquet`, and writes `articles.parquet` plus
+`article_categories.parquet`. The remaining preprocessing steps are ordinary
+Python/NumPy/Pandas/SQLite jobs, except for the embedding model in steps 6 and
+7.
 
 Script 04 writes `local_history_index.parquet`. Script 05 streams that Parquet
 file into `local_history_search.sqlite` and builds a persistent SQLite FTS5

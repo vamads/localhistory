@@ -202,7 +202,7 @@ def load_citation_counts(location_name: str) -> dict[int, int]:
     require_current_index(
         CITATION_INDEX_PATH,
         SQLITE_SEARCH_PATH,
-        "python preprocessing/08_build_citation_index.py --overwrite",
+        "python preprocessing/09_build_citation_index.py --overwrite",
     )
 
     database_uri = f"file:{CITATION_INDEX_PATH}?mode=ro&immutable=1"
@@ -226,7 +226,7 @@ def load_citation_counts(location_name: str) -> dict[int, int]:
         if stale:
             raise RuntimeError(
                 f"Stale citation index: {CITATION_INDEX_PATH}\n"
-                "Run: python preprocessing/08_build_citation_index.py --overwrite"
+                "Run: python preprocessing/09_build_citation_index.py --overwrite"
             )
         rows = connection.execute(
             query,
@@ -339,7 +339,7 @@ def load_kalm_embeddings():
     ):
         raise FileNotFoundError(
             "Missing memory-mapped embeddings. Run: "
-            "python preprocessing/06_build_embedding_memmap.py --overwrite"
+            "python preprocessing/07_build_embedding_memmap.py --overwrite"
         )
 
     matrix = np.load(KALM_EMBEDDING_MATRIX_PATH, mmap_mode="r")

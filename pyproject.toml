@@ -16,6 +16,7 @@ dependencies = [
 [project.optional-dependencies]
 api = [
     "fastapi==0.115.12",
+    "gunicorn",
     "uvicorn[standard]==0.34.2",
 ]
 semantic = [

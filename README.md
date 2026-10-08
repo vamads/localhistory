@@ -63,9 +63,9 @@ local data directory, set:
 export LOCAL_HISTORY_DATA_DIR=/path/to/localhistory/data
 ```
 
-## Runtime data contract
+## Runtime data
 
-The backend/inference deployment needs these five files in
+The backend/inference needs these five files in
 `LOCAL_HISTORY_DATA_DIR`:
 
 ```text
@@ -77,27 +77,11 @@ city_query_embeddings.npy
 ```
 
 `local_history_runtime.sqlite` is the consolidated read-only database created
-by step 10. It contains the article tables, SQLite FTS search index, citation
+by preprocessing step 11. It contains the article tables, SQLite FTS search index, citation
 index, and editorial-importance scores. The two `kalm_*.npy` files are the
 page-id-sorted article embedding matrix and its aligned page IDs. The two city
 files provide city aliases, coordinates, and precomputed query vectors, so the
 CPU-only runtime does not need KaLM or Torch.
-
-These build-only files do not need to be deployed when the runtime database
-exists:
-
-```text
-articles.parquet
-local_history_index.parquet
-local_history_search.sqlite
-local_history_citations.sqlite
-article_link_counts.parquet
-kalm_first_paragraph_embeddings/
-raw Wikipedia/Wikidata dumps
-```
-
-`runtime_manifest.json` is optional operational metadata and is not read by
-the API.
 
 ## Preprocessing pipeline
 
@@ -123,17 +107,17 @@ python preprocessing/02_extract_wikipedia.py
 python preprocessing/03_fetch_wikidata_metadata.py
 python preprocessing/04_build_search_index.py
 python preprocessing/05_build_sqlite_search.py
-python preprocessing/06_build_embedding_memmap.py
-python preprocessing/07_build_city_query_embeddings.py
-python preprocessing/08_build_citation_index.py
-python preprocessing/09_build_link_counts.py
-python preprocessing/10_build_runtime_database.py
+python preprocessing/06_build_kalm_embeddings.py
+python preprocessing/07_build_embedding_memmap.py
+python preprocessing/08_build_city_query_embeddings.py
+python preprocessing/09_build_citation_index.py
+python preprocessing/10_build_link_counts.py
+python preprocessing/11_build_runtime_database.py
 ```
 
 ### Rebuilding from source data
 
-For a complete rebuild, retain the following source inputs in the data
-directory:
+For a complete rebuild the pipeline needs data from wikidata.E.g., 
 
 ```text
 enwiki-{version}-page.sql.gz
@@ -143,29 +127,17 @@ enwiki-{version}-pagelinks.sql.gz
 enwiki-{version}-pages-articles.xml
 ```
 
-The pipeline also calls the Wikidata SPARQL endpoint in step 3 and uses the
-GeoNames data bundled by `geonamescache` in step 7. The intermediate files
-created along the way are `article_to_category.parquet`, `articles.parquet`,
-`article_categories.parquet`, `wikidata_metadata.parquet`,
-`local_history_index.parquet`, `local_history_search.sqlite`,
-`kalm_first_paragraph_embeddings/`, `kalm_embeddings.npy`,
-`kalm_embedding_page_ids.npy`, `city_queries.sqlite`,
-`city_query_embeddings.npy`, `local_history_citations.sqlite`,
-`article_link_counts.parquet`, and finally `local_history_runtime.sqlite`.
-
-For exact or auditable reproduction, record the download dates or dump
+For exact reproduction, record the download dates or dump
 versions, the Wikidata query date, the Python lock file, the KaLM model
 revision, and the generated `runtime_manifest.json`. The scripts currently
-refer to `enwiki-latest` and live Wikidata data, so rerunning them later is a
-logical rebuild but not necessarily a byte-for-byte reconstruction of the
-same corpus.
+refer to `enwiki-latest` and live Wikidata data, so rerunning them later is not necessarily a byte-for-byte reconstruction of the same Wikipedia corpus.
 
 The main PySpark workload is step 2, `preprocessing/02_extract_wikipedia.py`.
 It parses the full Wikipedia XML dump in a local Spark session, joins against
 `article_to_category.parquet`, and writes `articles.parquet` plus
 `article_categories.parquet`. The remaining preprocessing steps are ordinary
 Python/NumPy/Pandas/SQLite jobs, except for the embedding model in steps 6 and
-7.
+8.
 
 Script 04 writes `local_history_index.parquet`. Script 05 streams that Parquet
 file into `local_history_search.sqlite` and builds a persistent SQLite FTS5
@@ -178,21 +150,22 @@ Candidate retrieval unions two independent groups: every article inside the
 coordinate radius, and articles containing an exact qualified-place phrase
 such as `"Jackson Michigan"` or `"Jackson MI"`. Bare city-word and full-text
 proximity matches are intentionally excluded to avoid namesake false positives.
-Script 06 converts the embedding checkpoints into a sorted NumPy memory map.
+Script 06 generates resumable KaLM first-paragraph embedding checkpoints.
+Script 07 converts those checkpoints into a sorted NumPy memory map.
 Search then reads only vectors belonging to the FTS candidates rather than
 loading the complete embedding matrix into RAM and accelerator memory.
-Script 07 builds a local GeoNames city/alias resolver and precomputes one KaLM
+Script 08 builds a local GeoNames city/alias resolver and precomputes one KaLM
 query vector per city. Recognized city searches then avoid both the Nominatim
 request and loading KaLM at runtime. The city data is provided by GeoNames
 under CC BY 4.0: https://www.geonames.org/
-Script 08 extracts only citation-like sentences into a separate SQLite FTS5
+Script 09 extracts only citation-like sentences into a separate SQLite FTS5
 index. Search can then look up citation-context matches by city phrase without
 scanning or splitting candidate article text at runtime.
-Script 09 is a one-time link-data job. It counts links from all normal
+Script 10 is a one-time link-data job. It counts links from all normal
 Wikipedia articles to normal Wikipedia articles, then writes only Local
 History targets to `article_link_counts.parquet`. It also writes metadata to
 `article_link_counts.json`; neither output is required until link importance
-is added to the runtime ranking. Script 10 imports those scores into the
+is added to the runtime ranking. Script 11 imports those scores into the
 production database.
 
 When `article_link_counts.parquet` is present, search loads its incoming-link
@@ -200,7 +173,7 @@ counts once, applies `log1p`, caps them at the 99th percentile, and adds a small
 editorial-prominence bonus to already-retrieved candidates. Link data does not
 create candidates or override local text, quality, and geographic relevance.
 
-For deployment, script 10 creates `local_history_runtime.sqlite`, which
+For deployment, script 11 creates `local_history_runtime.sqlite`, which
 contains the article search tables, article FTS index, citation FTS index, and
 article importance scores. The API automatically prefers this finalized
 database when it exists. The raw search database, citation database, link-count

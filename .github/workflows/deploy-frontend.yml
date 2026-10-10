@@ -35,6 +35,7 @@ jobs:
         run: npm ci
 
       - name: Build
+	env: VITE_API_URL: https://hccla0f7pg.execute-api.us-east-2.amazonaws.com
         working-directory: web
         run: npm run build
 

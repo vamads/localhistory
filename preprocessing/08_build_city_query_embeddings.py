@@ -1,6 +1,6 @@
 """Build a GeoNames city resolver and precomputed KaLM query embeddings.
 
-The default GeoNames tier contains cities with populations above 15,000 plus
+The default GeoNames tier contains cities with populations above 500 plus
 capitals. One canonical query is embedded per city; alternate names are kept
 as SQLite aliases pointing at that vector.
 
@@ -325,7 +325,7 @@ def main() -> None:
         "--minimum-population",
         type=int,
         choices=SUPPORTED_POPULATION_TIERS,
-        default=15_000,
+        default=500,
     )
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--device", choices=("cpu", "mps", "cuda"))

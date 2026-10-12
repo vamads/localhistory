@@ -367,12 +367,22 @@ def kalm_scores(
 
     query_embedding = precomputed_city_embedding(location_name)
     if query_embedding is None:
-        model = load_kalm_model()
-        query_embedding = model.encode(
-            [location_name],
-            normalize_embeddings=True,
-            show_progress_bar=False,
-        )[0].astype(np.float32)
+        # A city can be absent from the precomputed resolver when it falls
+        # below its population tier (for example, Gaylord, Michigan).  A
+        # qualified place query still has an exact FTS/BM25 path, so semantic
+        # ranking must remain optional instead of making the whole search
+        # depend on a model download or a local semantic installation.
+        if "," in location_name:
+            return pd.Series(dtype="float32")
+        try:
+            model = load_kalm_model()
+            query_embedding = model.encode(
+                [location_name],
+                normalize_embeddings=True,
+                show_progress_bar=False,
+            )[0].astype(np.float32)
+        except (ImportError, OSError, RuntimeError):
+            return pd.Series(dtype="float32")
     if query_embedding.shape != (embedding_matrix.shape[1],):
         raise ValueError(
             "Query and article embedding dimensions do not match: "

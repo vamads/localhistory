@@ -17,6 +17,7 @@ from pydantic import BaseModel
 
 from .city_queries import resolve_city_query
 from .search import SQLITE_SEARCH_PATH, search_local_history
+from .text import clean_article_text
 
 
 logger = logging.getLogger("localhistory.api")
@@ -150,7 +151,7 @@ def card_from_row(row: pd.Series) -> ArticleCard:
     return ArticleCard(
         page_id=int(row["page_id"]),
         title=clean_text(row["title"]),
-        first_paragraph=clean_text(row.get("first_paragraph")),
+        first_paragraph=clean_article_text(row.get("first_paragraph")),
         entity_class=clean_text(row.get("entity_class"), "other"),
         year=finite_int(row.get("year")),
         country=country,
@@ -253,8 +254,8 @@ def article(page_id: int) -> ArticleDetail:
     return ArticleDetail(
         page_id=page_id,
         title=clean_text(title),
-        first_paragraph=clean_text(first_paragraph),
-        full_text=clean_text(full_text),
+        first_paragraph=clean_article_text(first_paragraph),
+        full_text=clean_article_text(full_text),
         entity_class=clean_text(entity_class, "other"),
         year=finite_int(year),
         country=clean_text(country) or None,

@@ -179,6 +179,15 @@ def extract_text(wikitext: str) -> tuple[str, str]:
         wikicode = mwparserfromhell.parse(wikitext)
         plain = wikicode.strip_code(normalize=True, collapse=True)
 
+        # strip_code() removes the File node but can leave image options and
+        # captions behind as a line such as ``thumb|Caption``.
+        plain = re.sub(
+            r"(?im)^\s*(?:thumb|right|left|center|frame|frameless|border|"
+            r"upright(?:\s*=\s*[^|\n]+)?)(?:\|.*)?\s*$",
+            "",
+            plain,
+        )
+
         # Split into paragraphs, skip empty ones and very short ones
         # (short ones are usually template artifacts like "See also")
         paragraphs = [p.strip() for p in plain.split("\n") if len(p.strip()) > 50]

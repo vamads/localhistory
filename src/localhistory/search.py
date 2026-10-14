@@ -423,6 +423,42 @@ def normalize_scores(values: pd.Series) -> pd.Series:
     return (values - minimum) / (maximum - minimum)
 
 
+def reciprocal_rank_fusion(
+    rankings: dict[str, pd.DataFrame],
+    *,
+    top_n: int | None = None,
+    k: int = 60,
+    weights: dict[str, float] | None = None,
+) -> pd.DataFrame:
+    """Fuse independently ranked result frames with Reciprocal Rank Fusion."""
+    if k <= 0:
+        raise ValueError("RRF k must be positive")
+    weights = weights or {}
+    fused: dict[int, dict[str, object]] = {}
+    for name, frame in rankings.items():
+        if "page_id" not in frame:
+            raise ValueError(f"Ranking {name!r} is missing page_id")
+        weight = float(weights.get(name, 1.0))
+        for rank, page_id in enumerate(
+            frame.drop_duplicates("page_id")["page_id"].tolist(), start=1
+        ):
+            page_id = int(page_id)
+            entry = fused.setdefault(
+                page_id,
+                {"page_id": page_id, "rrf_score": 0.0, "retrieval_sources": []},
+            )
+            entry["rrf_score"] += weight / (k + rank)
+            entry["retrieval_sources"].append(name)
+    result = pd.DataFrame(fused.values())
+    if result.empty:
+        return pd.DataFrame(columns=["page_id", "rrf_score", "retrieval_sources"])
+    result["retrieval_sources"] = result["retrieval_sources"].map(
+        lambda sources: ",".join(sources)
+    )
+    result = result.sort_values("rrf_score", ascending=False, kind="stable")
+    return result.head(top_n).reset_index(drop=True) if top_n else result.reset_index(drop=True)
+
+
 def place_occurrence_features(
     frame: pd.DataFrame,
     location_name: str,
@@ -488,6 +524,139 @@ def article_quality_features(frame: pd.DataFrame) -> pd.DataFrame:
     return frame
 
 
+# ── Retrieval and ranking stages ──────────────────────────────────────────────
+
+def prepare_search_features(
+    frame: pd.DataFrame,
+    location_name: str,
+) -> tuple[pd.DataFrame, pd.Series]:
+    """Add shared text, quality, citation, and normalized score features."""
+    frame = article_quality_features(place_occurrence_features(frame.copy(), location_name))
+    frame["bm25_score"] = pd.to_numeric(frame["bm25_score"], errors="coerce").fillna(0.0)
+    frame["exact_score"] = (
+        10 * frame["exact_title_match"].astype(float)
+        + 3 * frame["exact_full_text_match"].astype(float)
+    )
+    text_match = (
+        frame["exact_title_match"]
+        | frame["lead_exact_match"]
+        | frame["exact_full_text_match"]
+    )
+    citation_counts = load_citation_counts(location_name)
+    frame["citation_context_count"] = frame["page_id"].map(citation_counts).fillna(0).astype("int8")
+    frame["citation_penalty"] = np.where(
+        frame["exact_title_match"] | frame["lead_exact_match"],
+        0.0,
+        np.minimum(8.0, 4.0 * frame["citation_context_count"]),
+    )
+    frame["kalm_score"] = frame["page_id"].map(
+        kalm_scores(location_name, tuple(frame.loc[text_match, "page_id"].tolist()))
+    ).fillna(0.0)
+    frame["bm25_score_normalized"] = 0.0
+    frame["kalm_score_normalized"] = 0.0
+    frame.loc[text_match, "bm25_score_normalized"] = normalize_scores(
+        frame.loc[text_match, "bm25_score"]
+    )
+    frame.loc[text_match, "kalm_score_normalized"] = normalize_scores(
+        frame.loc[text_match, "kalm_score"]
+    )
+    return frame, text_match
+
+
+def retrieve_coordinate_candidates(
+    frame: pd.DataFrame,
+    user_lat: float,
+    user_lon: float,
+    radius_km: float,
+) -> pd.DataFrame:
+    """Retrieve nearby articles and attach their haversine distances."""
+    coords = frame[["page_id", "lat", "lon"]].dropna(subset=["lat", "lon"])
+    lat1 = math.radians(user_lat)
+    lat2 = np.radians(coords["lat"].to_numpy(dtype=np.float64))
+    dlat = lat2 - lat1
+    dlambda = np.radians(coords["lon"].to_numpy(dtype=np.float64) - user_lon)
+    a = np.sin(dlat / 2) ** 2 + math.cos(lat1) * np.cos(lat2) * np.sin(dlambda / 2) ** 2
+    distances = 6371.0 * 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+    distance_by_page_id = pd.Series(distances, index=coords["page_id"].to_numpy(), dtype="float64")
+    frame = frame.copy()
+    frame["distance_km"] = frame["page_id"].map(distance_by_page_id)
+    candidates = frame[frame["distance_km"].notna() & (frame["distance_km"] <= radius_km)].copy()
+    candidates["source"] = "coordinates"
+    return candidates
+
+
+def retrieve_bm25_candidates(
+    frame: pd.DataFrame,
+    text_match: pd.Series,
+    nearby_ids: set,
+    bm25_min_score: float,
+) -> pd.DataFrame:
+    """Retrieve text-only candidates from the BM25 branch."""
+    candidates = frame[
+        (frame["bm25_score"] >= bm25_min_score)
+        & text_match
+        & ~frame["page_id"].isin(nearby_ids)
+        & frame["lat"].isna()
+    ].copy()
+    candidates["distance_km"] = np.nan
+    candidates["source"] = "bm25"
+    return candidates
+
+
+def retrieve_dense_candidates(
+    frame: pd.DataFrame,
+    text_match: pd.Series,
+    nearby_ids: set,
+    kalm_top_k: int,
+) -> pd.DataFrame:
+    """Retrieve exact-title and top dense candidates missed by BM25."""
+    ranked_kalm = frame[text_match].nlargest(kalm_top_k, "kalm_score")
+    candidates = frame[
+        (frame["exact_title_match"] | frame["page_id"].isin(ranked_kalm["page_id"]))
+        & ~frame["page_id"].isin(nearby_ids)
+        & frame["lat"].isna()
+    ].copy()
+    candidates["distance_km"] = np.nan
+    candidates["source"] = "exact_or_kalm"
+    return candidates
+
+
+def combine_retrieval_results(*candidate_frames: pd.DataFrame) -> pd.DataFrame:
+    """Combine branches, preferring coordinate evidence on overlap."""
+    return pd.concat(candidate_frames).drop_duplicates(subset="page_id", keep="first")
+
+
+def score_candidates(frame: pd.DataFrame, radius_km: float) -> pd.DataFrame:
+    """Apply the current text-led ranking policy to retrieved candidates."""
+    frame = frame.copy()
+    editorial_importance = load_editorial_importance()
+    frame["editorial_importance"] = frame["page_id"].map(editorial_importance).fillna(0.0)
+    score = frame["exact_score"].astype(float) - frame["citation_penalty"]
+    score += 5 * frame["bm25_score_normalized"] + 2 * frame["kalm_score_normalized"]
+    score += (
+        8 * frame["place_title_mentions"]
+        + 5 * frame["place_lead_mentions"]
+        + 2 * np.log1p(frame["place_title_mentions"] + frame["place_lead_mentions"])
+        + 4 * frame["place_position_score"]
+    )
+    score += (0.5 * (1 - frame["distance_km"] / max(radius_km, 1.0))).clip(lower=0).fillna(0)
+    score += ((5 - frame["hop"]) * 2).fillna(0)
+    score += frame["quality_score"] + 0.25 * frame["editorial_importance"]
+    frame["score"] = score
+    return frame
+
+
+def finalize_results(frame: pd.DataFrame, top_n: int) -> tuple[pd.DataFrame, dict[str, int]]:
+    """Keep all mapped results and the best text-only results."""
+    coordinate_results = frame[frame["distance_km"].notna()]
+    text_results = frame[frame["distance_km"].isna()].nlargest(top_n, "score")
+    results = pd.concat([coordinate_results, text_results.head(top_n)], ignore_index=True)
+    return results.sort_values("score", ascending=False), {
+        "total_found": len(frame),
+        "from_coords": int((frame["source"] == "coordinates").sum()),
+    }
+
+
 # ── Main search ───────────────────────────────────────────────────────────────
 
 
@@ -509,150 +678,22 @@ def search_local_history(
             radius_km,
         )
 
-    df = index.copy()
-
-    df = place_occurrence_features(df, location_name)
-    df = article_quality_features(df)
-
-    df["bm25_score"] = pd.to_numeric(
-        df["bm25_score"], errors="coerce"
-    ).fillna(0.0)
-    df["exact_score"] = (
-        10 * df["exact_title_match"].astype(float)
-        + 3 * df["exact_full_text_match"].astype(float)
+    features, text_match = prepare_search_features(index, location_name)
+    coordinate_candidates = retrieve_coordinate_candidates(
+        features, user_lat, user_lon, radius_km
     )
-    text_match = (
-        df["exact_title_match"]
-        | df["lead_exact_match"]
-        | df["exact_full_text_match"]
+    nearby_ids = set(coordinate_candidates["page_id"])
+    bm25_candidates = retrieve_bm25_candidates(
+        features, text_match, nearby_ids, bm25_min_score
     )
-    citation_counts = load_citation_counts(location_name)
-    df["citation_context_count"] = (
-        df["page_id"].map(citation_counts).fillna(0).astype("int8")
+    dense_candidates = retrieve_dense_candidates(
+        features, text_match, nearby_ids, kalm_top_k
     )
-    # Citation context is a weak negative signal, not a per-reference
-    # subtraction. Strong title/lead evidence means the article is topical,
-    # even if it contains many ordinary bibliographic references.
-    df["citation_penalty"] = np.where(
-        df["exact_title_match"] | df["lead_exact_match"],
-        0.0,
-        np.minimum(8.0, 4.0 * df["citation_context_count"]),
+    combined = combine_retrieval_results(
+        coordinate_candidates,
+        bm25_candidates,
+        dense_candidates,
     )
-
-    # KaLM embeddings represent first paragraphs (see kalm_embeddings.py).
-    kalm_by_page_id = kalm_scores(
-        location_name,
-        tuple(df.loc[text_match, "page_id"].tolist()),
-    )
-    df["kalm_score"] = df["page_id"].map(kalm_by_page_id).fillna(0.0)
-    df["bm25_score_normalized"] = 0.0
-    df["kalm_score_normalized"] = 0.0
-    df.loc[text_match, "bm25_score_normalized"] = normalize_scores(
-        df.loc[text_match, "bm25_score"]
-    )
-    df.loc[text_match, "kalm_score_normalized"] = normalize_scores(
-        df.loc[text_match, "kalm_score"]
-    )
-
-    # Layer 1: coordinate proximity. The candidate index already contains
-    # coordinates, so do not reload the full coordinate corpus.
-    coords = df[["page_id", "lat", "lon"]].dropna(subset=["lat", "lon"])
-    lat1 = math.radians(user_lat)
-    lat2 = np.radians(coords["lat"].to_numpy(dtype=np.float64))
-    dlat = lat2 - lat1
-    dlambda = np.radians(coords["lon"].to_numpy(dtype=np.float64) - user_lon)
-    a = (
-        np.sin(dlat / 2) ** 2
-        + math.cos(lat1) * np.cos(lat2) * np.sin(dlambda / 2) ** 2
-    )
-    distances = 6371.0 * 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
-    distance_by_page_id = pd.Series(
-        distances,
-        index=coords["page_id"].to_numpy(),
-        dtype="float64",
-    )
-    df["distance_km"] = df["page_id"].map(distance_by_page_id)
-    nearby = df[df["distance_km"].notna() & (df["distance_km"] <= radius_km)].copy()
-    nearby["source"] = "coordinates"
-
-    # Layer 2: BM25 fallback for articles without coordinate candidates.
-    # BM25 scores individual terms, so require the complete city phrase here.
-    nearby_ids = set(nearby["page_id"])
-    bm25_matches = df[
-        (df["bm25_score"] >= bm25_min_score)
-        & text_match
-        & ~df["page_id"].isin(nearby_ids)
-        & df["lat"].isna()
-    ].copy()
-    bm25_matches["distance_km"] = np.nan
-    bm25_matches["source"] = "bm25"
-
-    # Add exact-title and semantic candidates that BM25 may miss.
-    ranked_kalm = df[text_match].nlargest(kalm_top_k, "kalm_score")
-    extra_matches = df[
-        (
-            df["exact_title_match"]
-            | df["page_id"].isin(ranked_kalm["page_id"])
-        )
-        & ~df["page_id"].isin(nearby_ids)
-        & df["lat"].isna()
-    ].copy()
-    extra_matches["distance_km"] = np.nan
-    extra_matches["source"] = "exact_or_kalm"
-
-    # Coordinate candidates take precedence; BM25 supplies the missing ones.
-    combined = pd.concat([nearby, bm25_matches, extra_matches]).drop_duplicates(
-        subset="page_id", keep="first"
-    )
-
-    # Incoming Wikipedia links are a secondary editorial-prominence signal.
-    # Local retrieval has already defined the candidate set; this only helps
-    # order relevant candidates and cannot introduce globally popular pages.
-    editorial_importance = load_editorial_importance()
-    combined["editorial_importance"] = (
-        combined["page_id"].map(editorial_importance).fillna(0.0)
-    )
-
-    score = combined["exact_score"].astype(float)
-    score -= combined["citation_penalty"]
-    score += 5 * combined["bm25_score_normalized"]
-    score += 2 * combined["kalm_score_normalized"]
-    score += (
-        8 * combined["place_title_mentions"]
-        + 5 * combined["place_lead_mentions"]
-        + 2 * np.log1p(
-            combined["place_title_mentions"]
-            + combined["place_lead_mentions"]
-        )
-        + 4 * combined["place_position_score"]
-    )
-    # Geography is context, not relevance. Keep it as a small tie-breaker so
-    # a strong text match can outrank a weak coordinate-only match.
-    score += (
-        0.5 * (1 - combined["distance_km"] / max(radius_km, 1.0))
-    ).clip(lower=0).fillna(0)
-    score += ((5 - combined["hop"]) * 2).fillna(0)
-    score += combined["quality_score"]
-    score += 0.25 * combined["editorial_importance"]
-    combined["score"] = score
-
-    # Coordinates are a hard inclusion rule, not a ranking rule. Keep every
-    # coordinate-backed result, add the best text-only results, and then rank
-    # the combined set by the same text-led score.
-    coordinate_results = combined[combined["distance_km"].notna()]
-    text_results = combined[combined["distance_km"].isna()].nlargest(
-        top_n,
-        "score",
-    )
-    results = pd.concat(
-        [coordinate_results, text_results.head(top_n)],
-        ignore_index=True,
-    ).sort_values("score", ascending=False)
-
-    return {
-        "results": results,
-        "stats": {
-            "total_found": len(combined),
-            "from_coords": (combined["source"] == "coordinates").sum(),
-        },
-    }
+    scored = score_candidates(combined, radius_km)
+    results, stats = finalize_results(scored, top_n)
+    return {"results": results, "stats": stats}

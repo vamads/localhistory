@@ -54,6 +54,10 @@ KALM_EMBEDDING_MATRIX_PATH = DATA_DIR / "kalm_embeddings.npy"
 KALM_EMBEDDING_PAGE_IDS_PATH = DATA_DIR / "kalm_embedding_page_ids.npy"
 LINK_COUNTS_PATH = DATA_DIR / "article_link_counts.parquet"
 KALM_MODEL_NAME = "KaLM-Embedding/KaLM-embedding-multilingual-mini-instruct-v2.5"
+RERANKER_MODEL_NAME = "BAAI/bge-reranker-v2-m3"
+RRF_K = 60
+RERANKER_TOP_K = 50
+RERANKER_WEIGHT = 5.0
 ARTICLE_COLUMNS = """
     articles.page_id,
     articles.title,
@@ -349,6 +353,24 @@ def load_kalm_model():
     )
     model.max_seq_length = 4096
     return model
+
+
+@lru_cache(maxsize=1)
+def load_cross_encoder():
+    """Load the second-stage cross-encoder once per API process."""
+    try:
+        from sentence_transformers import CrossEncoder
+    except ImportError as exc:
+        raise RuntimeError(
+            "The cross-encoder requires sentence-transformers. Install the "
+            "optional semantic dependencies with: pip install -e '.[semantic]'"
+        ) from exc
+
+    return CrossEncoder(
+        RERANKER_MODEL_NAME,
+        device=os.getenv("LOCAL_HISTORY_RERANKER_DEVICE", "cpu"),
+        max_length=512,
+    )
 
 
 @lru_cache(maxsize=1)
@@ -691,17 +713,34 @@ def combine_retrieval_results(*candidate_frames: pd.DataFrame) -> pd.DataFrame:
     return pd.concat(candidate_frames).drop_duplicates(subset="page_id", keep="first")
 
 
+def fuse_text_retrieval_ranks(
+    bm25_candidates: pd.DataFrame,
+    dense_candidates: pd.DataFrame,
+    *,
+    k: int = 60,
+) -> pd.DataFrame:
+    """Build independently ranked BM25/KALM lists and fuse them with RRF."""
+    rankings = {
+        "bm25": bm25_candidates.sort_values(
+            "bm25_score", ascending=False, kind="stable"
+        )[["page_id"]],
+        "kalm": dense_candidates.sort_values(
+            "dense_score", ascending=False, kind="stable"
+        )[["page_id"]],
+    }
+    return reciprocal_rank_fusion(rankings, k=k)
+
+
 def score_candidates(frame: pd.DataFrame, radius_km: float) -> pd.DataFrame:
     """Apply the current text-led ranking policy to retrieved candidates."""
     frame = frame.copy()
     editorial_importance = load_editorial_importance()
     frame["editorial_importance"] = frame["page_id"].map(editorial_importance).fillna(0.0)
-    score = frame["exact_score"].astype(float) - frame["citation_penalty"]
-    score += (
-        5 * frame["bm25_score_normalized"]
-        + 2 * frame["kalm_score_normalized"]
-        + 2 * frame["dense_score_normalized"]
-    )
+    # RRF scores are small (roughly 0.01–0.03 for k=60), so scale them into
+    # the same practical range as the other ranking signals. The rank fusion
+    # itself remains independent of raw BM25/cosine score magnitudes.
+    score = 100 * frame["rrf_score"].fillna(0.0)
+    score += frame["exact_score"].astype(float) - frame["citation_penalty"]
     score += (
         8 * frame["place_title_mentions"]
         + 5 * frame["place_lead_mentions"]
@@ -712,6 +751,47 @@ def score_candidates(frame: pd.DataFrame, radius_km: float) -> pd.DataFrame:
     score += ((5 - frame["hop"]) * 2).fillna(0)
     score += frame["quality_score"] + 0.25 * frame["editorial_importance"]
     frame["score"] = score
+    return frame
+
+
+def rerank_with_cross_encoder(
+    frame: pd.DataFrame,
+    location_name: str,
+    *,
+    top_k: int = RERANKER_TOP_K,
+) -> pd.DataFrame:
+    """Rerank the best text candidates after RRF with a cross-encoder."""
+    frame = frame.copy()
+    frame["cross_encoder_score"] = np.nan
+    eligible = frame[frame["distance_km"].isna()].nlargest(top_k, "score")
+    if eligible.empty:
+        return frame
+
+    pairs = [
+        (
+            location_name,
+            f"{row.title}. {row.first_paragraph}",
+        )
+        for row in eligible.itertuples()
+    ]
+    reranker_scores = np.asarray(
+        load_cross_encoder().predict(
+            pairs,
+            batch_size=16,
+            show_progress_bar=False,
+        ),
+        dtype=float,
+    ).reshape(-1)
+    score_by_page_id = pd.Series(
+        reranker_scores,
+        index=eligible["page_id"].to_numpy(),
+        dtype="float64",
+    )
+    frame["cross_encoder_score"] = frame["page_id"].map(score_by_page_id)
+    reranked = frame["cross_encoder_score"].notna()
+    frame.loc[reranked, "score"] += RERANKER_WEIGHT * normalize_scores(
+        frame.loc[reranked, "cross_encoder_score"]
+    )
     return frame
 
 
@@ -775,11 +855,22 @@ def search_local_history(
     ].copy()
     dense_candidates["distance_km"] = np.nan
     dense_candidates["source"] = "dense"
+    rrf_scores = fuse_text_retrieval_ranks(
+        bm25_candidates,
+        dense_candidates,
+        k=RRF_K,
+    )
     combined = combine_retrieval_results(
         coordinate_candidates,
         bm25_candidates,
         dense_candidates,
     )
+    combined = combined.merge(
+        rrf_scores[["page_id", "rrf_score"]],
+        on="page_id",
+        how="left",
+    )
     scored = score_candidates(combined, radius_km)
+    scored = rerank_with_cross_encoder(scored, location_name)
     results, stats = finalize_results(scored, top_n)
     return {"results": results, "stats": stats}

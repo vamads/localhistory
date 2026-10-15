@@ -310,6 +310,27 @@ def load_sqlite_coordinate_candidates(
         return pd.read_sql_query(query, connection, params=parameters)
 
 
+def load_sqlite_page_candidates(page_ids: list[int]) -> pd.DataFrame:
+    """Load article metadata for IDs returned by an independent retriever."""
+    if not page_ids:
+        return pd.DataFrame()
+    placeholders = ",".join("?" for _ in page_ids)
+    query = f"""
+        SELECT
+            {ARTICLE_COLUMNS},
+            0.0 AS bm25_score,
+            0 AS exact_title_match,
+            0 AS lead_exact_match,
+            0 AS exact_full_text_match
+        FROM articles
+        WHERE NOT articles.is_redirect
+          AND articles.page_id IN ({placeholders})
+    """
+    database_uri = f"file:{SQLITE_SEARCH_PATH}?mode=ro&immutable=1"
+    with sqlite3.connect(database_uri, uri=True) as connection:
+        return pd.read_sql_query(query, connection, params=page_ids)
+
+
 @lru_cache(maxsize=1)
 def load_kalm_model():
     """Load KaLM only for the optional non-city query fallback."""
@@ -356,37 +377,43 @@ def load_kalm_embeddings():
 
 
 @lru_cache(maxsize=16)
+def query_embedding(location_name: str) -> np.ndarray | None:
+    """Load or compute one normalized embedding for a search query."""
+    query_embedding = precomputed_city_embedding(location_name)
+    if query_embedding is not None:
+        return query_embedding
+    # A qualified place query still has an exact FTS/BM25 path. Do not make
+    # it depend on downloading the optional semantic model.
+    if "," in location_name:
+        return None
+    try:
+        model = load_kalm_model()
+        return model.encode(
+            [location_name],
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        )[0].astype(np.float32)
+    except (ImportError, OSError, RuntimeError):
+        return None
+
+
+@lru_cache(maxsize=16)
 def kalm_scores(
     location_name: str,
     target_page_ids: tuple[int, ...],
 ) -> pd.Series:
-    """Return cosine similarity to each stored first-paragraph embedding."""
+    """Return cosine similarity for selected article page IDs."""
     embedding_matrix, embedding_page_ids = load_kalm_embeddings()
     if len(embedding_page_ids) == 0:
         return pd.Series(dtype="float32")
 
-    query_embedding = precomputed_city_embedding(location_name)
-    if query_embedding is None:
-        # A city can be absent from the precomputed resolver when it falls
-        # below its population tier (for example, Gaylord, Michigan).  A
-        # qualified place query still has an exact FTS/BM25 path, so semantic
-        # ranking must remain optional instead of making the whole search
-        # depend on a model download or a local semantic installation.
-        if "," in location_name:
-            return pd.Series(dtype="float32")
-        try:
-            model = load_kalm_model()
-            query_embedding = model.encode(
-                [location_name],
-                normalize_embeddings=True,
-                show_progress_bar=False,
-            )[0].astype(np.float32)
-        except (ImportError, OSError, RuntimeError):
-            return pd.Series(dtype="float32")
-    if query_embedding.shape != (embedding_matrix.shape[1],):
+    query_vector = query_embedding(location_name)
+    if query_vector is None:
+        return pd.Series(dtype="float32")
+    if query_vector.shape != (embedding_matrix.shape[1],):
         raise ValueError(
             "Query and article embedding dimensions do not match: "
-            f"{query_embedding.shape} and {embedding_matrix.shape}"
+            f"{query_vector.shape} and {embedding_matrix.shape}"
         )
     requested_page_ids = np.fromiter(target_page_ids, dtype=np.int64)
     rows = np.searchsorted(embedding_page_ids, requested_page_ids)
@@ -407,10 +434,43 @@ def kalm_scores(
     )
     # Embeddings are normalized at generation time, so the dot product is
     # cosine similarity. Runtime search deliberately stays NumPy/CPU-only.
-    selected_scores = candidate_matrix @ query_embedding
+    selected_scores = candidate_matrix @ query_vector
     return pd.Series(
         dict(zip(selected_page_ids.tolist(), selected_scores.astype(float))),
         dtype="float32",
+    )
+
+
+@lru_cache(maxsize=16)
+def dense_retrieve_page_ids(
+    location_name: str,
+    top_k: int,
+) -> pd.DataFrame:
+    """Retrieve the top articles by scoring the complete embedding matrix."""
+    embedding_matrix, embedding_page_ids = load_kalm_embeddings()
+    query_vector = query_embedding(location_name)
+    if query_vector is None or len(embedding_page_ids) == 0:
+        return pd.DataFrame(columns=["page_id", "dense_score"])
+    if query_vector.shape != (embedding_matrix.shape[1],):
+        raise ValueError(
+            "Query and article embedding dimensions do not match: "
+            f"{query_vector.shape} and {embedding_matrix.shape}"
+        )
+
+    scores = np.asarray(embedding_matrix @ query_vector, dtype=np.float32)
+    limit = min(max(int(top_k), 0), len(scores))
+    if limit == 0:
+        return pd.DataFrame(columns=["page_id", "dense_score"])
+    if limit == len(scores):
+        candidate_rows = np.arange(len(scores))
+    else:
+        candidate_rows = np.argpartition(scores, -limit)[-limit:]
+    candidate_rows = candidate_rows[np.argsort(scores[candidate_rows])[::-1]]
+    return pd.DataFrame(
+        {
+            "page_id": embedding_page_ids[candidate_rows].astype(np.int64),
+            "dense_score": scores[candidate_rows].astype(float),
+        }
     )
 
 
@@ -552,13 +612,21 @@ def prepare_search_features(
     frame["kalm_score"] = frame["page_id"].map(
         kalm_scores(location_name, tuple(frame.loc[text_match, "page_id"].tolist()))
     ).fillna(0.0)
+    frame["dense_score"] = pd.to_numeric(
+        frame.get("dense_score", np.nan), errors="coerce"
+    )
     frame["bm25_score_normalized"] = 0.0
     frame["kalm_score_normalized"] = 0.0
+    frame["dense_score_normalized"] = 0.0
     frame.loc[text_match, "bm25_score_normalized"] = normalize_scores(
         frame.loc[text_match, "bm25_score"]
     )
     frame.loc[text_match, "kalm_score_normalized"] = normalize_scores(
         frame.loc[text_match, "kalm_score"]
+    )
+    dense_match = frame["dense_score"].notna()
+    frame.loc[dense_match, "dense_score_normalized"] = normalize_scores(
+        frame.loc[dense_match, "dense_score"]
     )
     return frame, text_match
 
@@ -604,20 +672,17 @@ def retrieve_bm25_candidates(
 
 
 def retrieve_dense_candidates(
-    frame: pd.DataFrame,
-    text_match: pd.Series,
-    nearby_ids: set,
+    location_name: str,
     kalm_top_k: int,
 ) -> pd.DataFrame:
-    """Retrieve exact-title and top dense candidates missed by BM25."""
-    ranked_kalm = frame[text_match].nlargest(kalm_top_k, "kalm_score")
-    candidates = frame[
-        (frame["exact_title_match"] | frame["page_id"].isin(ranked_kalm["page_id"]))
-        & ~frame["page_id"].isin(nearby_ids)
-        & frame["lat"].isna()
-    ].copy()
+    """Retrieve top candidates by scoring the full article matrix."""
+    ranking = dense_retrieve_page_ids(location_name, kalm_top_k)
+    candidates = load_sqlite_page_candidates(ranking["page_id"].astype(int).tolist())
+    if candidates.empty:
+        return candidates
+    candidates = candidates.merge(ranking, on="page_id", how="inner")
     candidates["distance_km"] = np.nan
-    candidates["source"] = "exact_or_kalm"
+    candidates["source"] = "dense"
     return candidates
 
 
@@ -632,7 +697,11 @@ def score_candidates(frame: pd.DataFrame, radius_km: float) -> pd.DataFrame:
     editorial_importance = load_editorial_importance()
     frame["editorial_importance"] = frame["page_id"].map(editorial_importance).fillna(0.0)
     score = frame["exact_score"].astype(float) - frame["citation_penalty"]
-    score += 5 * frame["bm25_score_normalized"] + 2 * frame["kalm_score_normalized"]
+    score += (
+        5 * frame["bm25_score_normalized"]
+        + 2 * frame["kalm_score_normalized"]
+        + 2 * frame["dense_score_normalized"]
+    )
     score += (
         8 * frame["place_title_mentions"]
         + 5 * frame["place_lead_mentions"]
@@ -678,7 +747,20 @@ def search_local_history(
             radius_km,
         )
 
-    features, text_match = prepare_search_features(index, location_name)
+    dense_index = retrieve_dense_candidates(location_name, kalm_top_k)
+    dense_scores = (
+        dense_index[["page_id", "dense_score"]]
+        if not dense_index.empty
+        else pd.DataFrame(columns=["page_id", "dense_score"])
+    )
+    combined_index = pd.concat([index, dense_index], ignore_index=True).drop_duplicates(
+        subset="page_id", keep="first"
+    )
+    combined_index = combined_index.drop(columns=["source", "distance_km"], errors="ignore")
+    combined_index = combined_index.drop(columns=["dense_score"], errors="ignore").merge(
+        dense_scores, on="page_id", how="left"
+    )
+    features, text_match = prepare_search_features(combined_index, location_name)
     coordinate_candidates = retrieve_coordinate_candidates(
         features, user_lat, user_lon, radius_km
     )
@@ -686,9 +768,13 @@ def search_local_history(
     bm25_candidates = retrieve_bm25_candidates(
         features, text_match, nearby_ids, bm25_min_score
     )
-    dense_candidates = retrieve_dense_candidates(
-        features, text_match, nearby_ids, kalm_top_k
-    )
+    dense_candidates = features[
+        features["dense_score"].notna()
+        & ~features["page_id"].isin(nearby_ids)
+        & features["lat"].isna()
+    ].copy()
+    dense_candidates["distance_km"] = np.nan
+    dense_candidates["source"] = "dense"
     combined = combine_retrieval_results(
         coordinate_candidates,
         bm25_candidates,

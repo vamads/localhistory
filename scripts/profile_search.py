@@ -26,9 +26,9 @@ import pandas as pd
 
 from localhistory.search import (
     SQLITE_SEARCH_PATH,
-    kalm_device,
     load_candidate_index,
     load_citation_counts,
+    load_cross_encoder,
     load_kalm_embeddings,
     load_kalm_model,
     search_local_history,
@@ -58,7 +58,7 @@ def torch_memory() -> dict[str, int | str] | None:
     try:
         import torch
 
-        device = kalm_device()
+        device = os.getenv("LOCAL_HISTORY_RERANKER_DEVICE", "cpu")
         result: dict[str, int | str] = {"device": device}
         if device.startswith("cuda"):
             result.update(
@@ -158,6 +158,7 @@ def main() -> None:
     for name, function in (
         ("Candidate index", load_candidate_index),
         ("Citation index", load_citation_counts),
+        ("Cross-encoder", load_cross_encoder),
         ("KaLM model", load_kalm_model),
         ("KaLM embeddings", load_kalm_embeddings),
     ):

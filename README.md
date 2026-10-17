@@ -74,6 +74,7 @@ kalm_embeddings.npy
 kalm_embedding_page_ids.npy
 city_queries.sqlite
 city_query_embeddings.npy
+kalm_embeddings.faiss
 ```
 
 `local_history_runtime.sqlite` is the consolidated read-only database created
@@ -82,6 +83,17 @@ index, and editorial-importance scores. The two `kalm_*.npy` files are the
 page-id-sorted article embedding matrix and its aligned page IDs. The two city
 files provide city aliases, coordinates, and precomputed query vectors, so the
 CPU-only runtime does not need KaLM or Torch.
+
+The optional `kalm_embeddings.faiss` file is an exact inner-product index over the normalized
+article embeddings. Build it after step 7 to accelerate dense retrieval:
+
+```bash
+python preprocessing/12_build_faiss_index.py
+```
+
+SQLite FTS5/BM25 remains the lexical retrieval path, and the cross-encoder still reranks the
+top 50 text candidates. If the FAISS package or index is unavailable, runtime search falls back
+to the existing NumPy implementation.
 
 ## Preprocessing pipeline
 

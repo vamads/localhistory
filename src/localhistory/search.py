@@ -52,6 +52,7 @@ CITATION_INDEX_PATH = (
 )
 KALM_EMBEDDING_MATRIX_PATH = DATA_DIR / "kalm_embeddings.npy"
 KALM_EMBEDDING_PAGE_IDS_PATH = DATA_DIR / "kalm_embedding_page_ids.npy"
+FAISS_INDEX_PATH = DATA_DIR / "kalm_embeddings.faiss"
 LINK_COUNTS_PATH = DATA_DIR / "article_link_counts.parquet"
 KALM_MODEL_NAME = "KaLM-Embedding/KaLM-embedding-multilingual-mini-instruct-v2.5"
 RERANKER_MODEL_NAME = "BAAI/bge-reranker-v2-m3"
@@ -398,6 +399,25 @@ def load_kalm_embeddings():
     return matrix, page_ids
 
 
+@lru_cache(maxsize=1)
+def load_faiss_index():
+    """Load the persisted exact inner-product index for dense retrieval."""
+    if not FAISS_INDEX_PATH.exists():
+        return None
+    try:
+        import faiss
+    except ImportError:
+        return None
+    index = faiss.read_index(str(FAISS_INDEX_PATH))
+    embedding_matrix, _ = load_kalm_embeddings()
+    if index.d != embedding_matrix.shape[1]:
+        raise ValueError(
+            "FAISS and embedding dimensions do not match: "
+            f"{index.d} and {embedding_matrix.shape[1]}"
+        )
+    return index
+
+
 @lru_cache(maxsize=16)
 def query_embedding(location_name: str) -> np.ndarray | None:
     """Load or compute one normalized embedding for a search query."""
@@ -469,20 +489,36 @@ def dense_retrieve_page_ids(
     top_k: int,
 ) -> pd.DataFrame:
     """Retrieve the top articles by scoring the complete embedding matrix."""
-    embedding_matrix, embedding_page_ids = load_kalm_embeddings()
     query_vector = query_embedding(location_name)
-    if query_vector is None or len(embedding_page_ids) == 0:
+    if query_vector is None:
         return pd.DataFrame(columns=["page_id", "dense_score"])
+    limit = max(int(top_k), 0)
+    if limit == 0:
+        return pd.DataFrame(columns=["page_id", "dense_score"])
+
+    index = load_faiss_index()
+    if index is not None:
+        scores, page_ids = index.search(
+            np.asarray(query_vector, dtype=np.float32).reshape(1, -1),
+            min(limit, index.ntotal),
+        )
+        valid = page_ids[0] >= 0
+        return pd.DataFrame(
+            {
+                "page_id": page_ids[0][valid].astype(np.int64),
+                "dense_score": scores[0][valid].astype(float),
+            }
+        )
+
+    # Compatibility fallback for environments without FAISS or its index file.
+    embedding_matrix, embedding_page_ids = load_kalm_embeddings()
     if query_vector.shape != (embedding_matrix.shape[1],):
         raise ValueError(
             "Query and article embedding dimensions do not match: "
             f"{query_vector.shape} and {embedding_matrix.shape}"
         )
-
     scores = np.asarray(embedding_matrix @ query_vector, dtype=np.float32)
-    limit = min(max(int(top_k), 0), len(scores))
-    if limit == 0:
-        return pd.DataFrame(columns=["page_id", "dense_score"])
+    limit = min(limit, len(scores))
     if limit == len(scores):
         candidate_rows = np.arange(len(scores))
     else:

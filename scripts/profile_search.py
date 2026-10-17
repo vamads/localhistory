@@ -92,7 +92,7 @@ def run_search(args: argparse.Namespace, index: pd.DataFrame) -> dict:
         radius_km=args.radius,
         top_n=args.top_n,
         bm25_min_score=1.0,
-        kalm_top_k=200,
+        dense_top_k=200,
         index=index,
     )
     sync_device()

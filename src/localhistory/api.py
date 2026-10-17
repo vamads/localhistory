@@ -196,7 +196,7 @@ async def search(
         radius_km=radius_km,
         top_n=limit,
         bm25_min_score=1.0,
-        kalm_top_k=200,
+        dense_top_k=200,
     )
     search_ms = (time.perf_counter() - search_started) * 1000
 

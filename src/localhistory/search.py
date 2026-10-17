@@ -1,11 +1,8 @@
-"""
-search.py
+"""Retrieval and ranking for local-history articles.
 
-Hybrid local history search combining:
-  1. Coordinate proximity   — articles within radius_km of user location
-  2. BM25 retrieval          — fallback for articles without coordinates
-  3. Scoring & ranking      — BM25, distance, entity class, hop, date
-
+The live pipeline combines SQLite coordinate/BM25 retrieval with FAISS dense
+retrieval, fuses those rankings, applies local-history relevance features, and
+uses a cross-encoder to rerank the top text candidates.
 """
 
 import math
@@ -53,10 +50,13 @@ CITATION_INDEX_PATH = (
 KALM_EMBEDDING_MATRIX_PATH = DATA_DIR / "kalm_embeddings.npy"
 KALM_EMBEDDING_PAGE_IDS_PATH = DATA_DIR / "kalm_embedding_page_ids.npy"
 FAISS_INDEX_PATH = DATA_DIR / "kalm_embeddings.faiss"
-LINK_COUNTS_PATH = DATA_DIR / "article_link_counts.parquet"
 KALM_MODEL_NAME = "KaLM-Embedding/KaLM-embedding-multilingual-mini-instruct-v2.5"
 RERANKER_MODEL_NAME = "BAAI/bge-reranker-v2-m3"
+
+# Ranking configuration. Keep retrieval limits separate from model settings so
+# search quality/latency experiments only require changing this section.
 RRF_K = 60
+DEFAULT_DENSE_TOP_K = 200
 RERANKER_TOP_K = 50
 RERANKER_WEIGHT = 5.0
 ARTICLE_COLUMNS = """
@@ -118,55 +118,6 @@ def require_current_index(path: Path, source: Path, build_command: str) -> None:
         return
     if source.exists() and path.stat().st_mtime < source.stat().st_mtime:
         raise RuntimeError(f"Stale search index: {path}\nRun: {build_command}")
-
-
-@lru_cache(maxsize=1)
-def load_editorial_importance() -> pd.Series:
-    """Load capped log incoming-link scores for optional secondary ranking.
-
-    The link-count job scans all normal Wikipedia article links but stores
-    only Local History targets. Missing link data is treated as a zero score
-    so search remains usable while the one-time preprocessing job is running.
-    """
-    if RUNTIME_DATABASE_PATH.exists():
-        database_uri = f"file:{RUNTIME_DATABASE_PATH}?mode=ro&immutable=1"
-        with sqlite3.connect(database_uri, uri=True) as connection:
-            rows = connection.execute(
-                "SELECT page_id, editorial_importance FROM article_importance"
-            ).fetchall()
-        if not rows:
-            return pd.Series(dtype="float64", name="editorial_importance")
-        return pd.Series(
-            [float(score) for _, score in rows],
-            index=[int(page_id) for page_id, _ in rows],
-            name="editorial_importance",
-        )
-
-    if not LINK_COUNTS_PATH.exists():
-        return pd.Series(dtype="float64", name="editorial_importance")
-
-    counts = pd.read_parquet(
-        LINK_COUNTS_PATH,
-        columns=["page_id", "incoming_link_count"],
-    )
-    counts["page_id"] = pd.to_numeric(counts["page_id"], errors="coerce")
-    counts["incoming_link_count"] = pd.to_numeric(
-        counts["incoming_link_count"], errors="coerce"
-    ).fillna(0.0).clip(lower=0.0)
-    counts = counts.dropna(subset=["page_id"]).drop_duplicates("page_id")
-
-    log_counts = np.log1p(counts["incoming_link_count"].to_numpy(dtype="float64"))
-    cap = float(np.quantile(log_counts, 0.99)) if len(log_counts) else 0.0
-    if cap <= 0.0:
-        scores = np.zeros(len(counts), dtype="float64")
-    else:
-        scores = np.clip(log_counts / cap, 0.0, 1.0)
-
-    return pd.Series(
-        scores,
-        index=counts["page_id"].astype("int64").to_numpy(),
-        name="editorial_importance",
-    )
 
 
 def quote_fts_phrase(value: str) -> str:
@@ -440,7 +391,7 @@ def query_embedding(location_name: str) -> np.ndarray | None:
 
 
 @lru_cache(maxsize=16)
-def kalm_scores(
+def dense_scores(
     location_name: str,
     target_page_ids: tuple[int, ...],
 ) -> pd.Series:
@@ -488,7 +439,7 @@ def dense_retrieve_page_ids(
     location_name: str,
     top_k: int,
 ) -> pd.DataFrame:
-    """Retrieve the top articles by scoring the complete embedding matrix."""
+    """Retrieve top articles with FAISS, falling back to NumPy."""
     query_vector = query_embedding(location_name)
     if query_vector is None:
         return pd.DataFrame(columns=["page_id", "dense_score"])
@@ -668,7 +619,7 @@ def prepare_search_features(
         np.minimum(8.0, 4.0 * frame["citation_context_count"]),
     )
     frame["kalm_score"] = frame["page_id"].map(
-        kalm_scores(location_name, tuple(frame.loc[text_match, "page_id"].tolist()))
+        dense_scores(location_name, tuple(frame.loc[text_match, "page_id"].tolist()))
     ).fillna(0.0)
     frame["dense_score"] = pd.to_numeric(
         frame.get("dense_score", np.nan), errors="coerce"
@@ -731,10 +682,10 @@ def retrieve_bm25_candidates(
 
 def retrieve_dense_candidates(
     location_name: str,
-    kalm_top_k: int,
+    dense_top_k: int,
 ) -> pd.DataFrame:
-    """Retrieve top candidates by scoring the full article matrix."""
-    ranking = dense_retrieve_page_ids(location_name, kalm_top_k)
+    """Retrieve top candidates from the FAISS dense index."""
+    ranking = dense_retrieve_page_ids(location_name, dense_top_k)
     candidates = load_sqlite_page_candidates(ranking["page_id"].astype(int).tolist())
     if candidates.empty:
         return candidates
@@ -770,8 +721,6 @@ def fuse_text_retrieval_ranks(
 def score_candidates(frame: pd.DataFrame, radius_km: float) -> pd.DataFrame:
     """Apply the current text-led ranking policy to retrieved candidates."""
     frame = frame.copy()
-    editorial_importance = load_editorial_importance()
-    frame["editorial_importance"] = frame["page_id"].map(editorial_importance).fillna(0.0)
     # RRF scores are small (roughly 0.01–0.03 for k=60), so scale them into
     # the same practical range as the other ranking signals. The rank fusion
     # itself remains independent of raw BM25/cosine score magnitudes.
@@ -785,7 +734,7 @@ def score_candidates(frame: pd.DataFrame, radius_km: float) -> pd.DataFrame:
     )
     score += (0.5 * (1 - frame["distance_km"] / max(radius_km, 1.0))).clip(lower=0).fillna(0)
     score += ((5 - frame["hop"]) * 2).fillna(0)
-    score += frame["quality_score"] + 0.25 * frame["editorial_importance"]
+    score += frame["quality_score"]
     frame["score"] = score
     return frame
 
@@ -852,7 +801,7 @@ def search_local_history(
     radius_km: float = 50.0,
     top_n: int = 30,
     bm25_min_score: float = 1.0,
-    kalm_top_k: int = 200,
+    dense_top_k: int = DEFAULT_DENSE_TOP_K,
     index: pd.DataFrame = None,
 ) -> dict:
     if index is None:
@@ -863,7 +812,7 @@ def search_local_history(
             radius_km,
         )
 
-    dense_index = retrieve_dense_candidates(location_name, kalm_top_k)
+    dense_index = retrieve_dense_candidates(location_name, dense_top_k)
     dense_scores = (
         dense_index[["page_id", "dense_score"]]
         if not dense_index.empty

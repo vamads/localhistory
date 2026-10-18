@@ -27,7 +27,6 @@ import pandas as pd
 from localhistory.search import (
     SQLITE_SEARCH_PATH,
     load_candidate_index,
-    load_citation_counts,
     load_cross_encoder,
     load_kalm_embeddings,
     load_kalm_model,
@@ -157,7 +156,6 @@ def main() -> None:
     print("\nCache sizes")
     for name, function in (
         ("Candidate index", load_candidate_index),
-        ("Citation index", load_citation_counts),
         ("Cross-encoder", load_cross_encoder),
         ("KaLM model", load_kalm_model),
         ("KaLM embeddings", load_kalm_embeddings),

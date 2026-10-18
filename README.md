@@ -153,15 +153,15 @@ Python/NumPy/Pandas/SQLite jobs, except for the embedding model in steps 6 and
 
 Script 04 writes `local_history_index.parquet`. Script 05 streams that Parquet
 file into `local_history_search.sqlite` and builds a persistent SQLite FTS5
-phrase index. FTS5 supplies both candidate retrieval and weighted BM25 ranking
-across title, first paragraph, and full text. The SQLite indexes are required
+phrase index. FTS5 supplies both candidate retrieval and equal-weight BM25
+ranking across title, first paragraph, and full text. The SQLite indexes are required
 at runtime; search reports the appropriate rebuild command if one is missing
 or stale. Article details and map coordinates are also read from this database,
 so the web API does not load the Parquet article index at runtime.
-Candidate retrieval unions two independent groups: every article inside the
-coordinate radius, and articles containing an exact qualified-place phrase
-such as `"Jackson Michigan"` or `"Jackson MI"`. Bare city-word and full-text
-proximity matches are intentionally excluded to avoid namesake false positives.
+Candidate retrieval starts with articles containing the city phrase somewhere
+in the indexed title, first paragraph, or full text. Nearby coordinates are
+used to rank those text-matching articles geographically; articles that do not
+contain the query phrase are not ranked.
 Script 06 generates resumable KaLM first-paragraph embedding checkpoints.
 Script 07 converts those checkpoints into a sorted NumPy memory map. Script 12
 builds an exact FAISS inner-product index for dense retrieval. Search uses
@@ -171,9 +171,9 @@ Script 08 builds a local GeoNames city/alias resolver and precomputes one KaLM
 query vector per city. Recognized city searches then avoid both the Nominatim
 request and loading KaLM at runtime. The city data is provided by GeoNames
 under CC BY 4.0: https://www.geonames.org/
-Script 09 extracts only citation-like sentences into a separate SQLite FTS5
-index. Search can then look up citation-context matches by city phrase without
-scanning or splitting candidate article text at runtime.
+Script 09 extracts citation-like sentences into a separate SQLite FTS5 index
+for optional downstream analysis; the main search ranking uses the article
+BM25 index directly.
 For deployment, script 11 creates `local_history_runtime.sqlite`, which
 contains the article search tables, article FTS index, and citation FTS index.
 Script 12 creates the separate FAISS dense-retrieval index. The API

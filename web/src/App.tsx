@@ -5,6 +5,23 @@ import type { ArticleCard, ArticleDetail, MapPoint, SearchResponse } from "./typ
 
 type MainTab = "connected" | "map" | "timeline";
 
+function articleParagraphs(fullText: string, lead: string): string[] {
+  const paragraphs = fullText
+    .split(/\n{2,}/)
+    .map((paragraph) => paragraph.trim())
+    .filter(Boolean);
+  const normalize = (value: string) => value.replace(/\s+/g, " ").trim();
+
+  if (
+    paragraphs.length > 0 &&
+    lead.trim() &&
+    normalize(paragraphs[0]) === normalize(lead)
+  ) {
+    return paragraphs.slice(1);
+  }
+  return paragraphs;
+}
+
 function ArticleRow({
   article,
   onSelect,
@@ -317,10 +334,9 @@ export default function App() {
             <p className="lead">{detail?.first_paragraph ?? selected.first_paragraph}</p>
             {detail ? (
               <div className="article-text">
-                {detail.full_text
-                  .split(/\n{2,}/)
-                  .slice(1)
-                  .map((paragraph, index) => <p key={index}>{paragraph}</p>)}
+                {articleParagraphs(detail.full_text, detail.first_paragraph).map(
+                  (paragraph, index) => <p key={index}>{paragraph}</p>,
+                )}
               </div>
             ) : (
               <p className="loading-copy">Loading article…</p>

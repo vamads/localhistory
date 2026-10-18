@@ -139,8 +139,6 @@ def match_reason(row: pd.Series) -> str:
         return "City in title"
     if row.get("lead_exact_match", False):
         return "City in introduction"
-    if row.get("citation_penalty", 0) > 0:
-        return "Article mention; citation context detected"
     if row.get("source") == "coordinates":
         return "Mapped nearby"
     return "City mentioned in article"
@@ -196,7 +194,7 @@ async def search(
         radius_km=radius_km,
         top_n=limit,
         bm25_min_score=1.0,
-        kalm_top_k=200,
+        dense_top_k=200,
     )
     search_ms = (time.perf_counter() - search_started) * 1000
 

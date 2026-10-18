@@ -65,7 +65,7 @@ export LOCAL_HISTORY_DATA_DIR=/path/to/localhistory/data
 
 ## Runtime data
 
-The backend/inference needs these five files in
+The backend/inference uses these runtime files in
 `LOCAL_HISTORY_DATA_DIR`:
 
 ```text
@@ -78,8 +78,8 @@ kalm_embeddings.faiss
 ```
 
 `local_history_runtime.sqlite` is the consolidated read-only database created
-by preprocessing step 11. It contains the article tables, SQLite FTS search index, citation
-index, and editorial-importance scores. The two `kalm_*.npy` files are the
+by preprocessing step 11. It contains the article tables, SQLite FTS search index,
+and citation index. The two `kalm_*.npy` files are the
 page-id-sorted article embedding matrix and its aligned page IDs. The two city
 files provide city aliases, coordinates, and precomputed query vectors, so the
 CPU-only runtime does not need KaLM or Torch.
@@ -123,8 +123,8 @@ python preprocessing/06_build_kalm_embeddings.py
 python preprocessing/07_build_embedding_memmap.py
 python preprocessing/08_build_city_query_embeddings.py
 python preprocessing/09_build_citation_index.py
-python preprocessing/10_build_link_counts.py
 python preprocessing/11_build_runtime_database.py
+python preprocessing/12_build_faiss_index.py
 ```
 
 ### Rebuilding from source data
@@ -153,43 +153,33 @@ Python/NumPy/Pandas/SQLite jobs, except for the embedding model in steps 6 and
 
 Script 04 writes `local_history_index.parquet`. Script 05 streams that Parquet
 file into `local_history_search.sqlite` and builds a persistent SQLite FTS5
-phrase index. FTS5 supplies both candidate retrieval and weighted BM25 ranking
-across title, first paragraph, and full text. The SQLite indexes are required
+phrase index. FTS5 supplies both candidate retrieval and equal-weight BM25
+ranking across title, first paragraph, and full text. The SQLite indexes are required
 at runtime; search reports the appropriate rebuild command if one is missing
 or stale. Article details and map coordinates are also read from this database,
 so the web API does not load the Parquet article index at runtime.
-Candidate retrieval unions two independent groups: every article inside the
-coordinate radius, and articles containing an exact qualified-place phrase
-such as `"Jackson Michigan"` or `"Jackson MI"`. Bare city-word and full-text
-proximity matches are intentionally excluded to avoid namesake false positives.
+Candidate retrieval starts with articles containing the city phrase somewhere
+in the indexed title, first paragraph, or full text. Nearby coordinates are
+used to rank those text-matching articles geographically; articles that do not
+contain the query phrase are not ranked.
 Script 06 generates resumable KaLM first-paragraph embedding checkpoints.
-Script 07 converts those checkpoints into a sorted NumPy memory map.
-Search then reads only vectors belonging to the FTS candidates rather than
-loading the complete embedding matrix into RAM and accelerator memory.
+Script 07 converts those checkpoints into a sorted NumPy memory map. Script 12
+builds an exact FAISS inner-product index for dense retrieval. Search uses
+SQLite FTS5/BM25 and FAISS to produce candidates, then reads only the selected
+candidate vectors for score fusion and reranking.
 Script 08 builds a local GeoNames city/alias resolver and precomputes one KaLM
 query vector per city. Recognized city searches then avoid both the Nominatim
 request and loading KaLM at runtime. The city data is provided by GeoNames
 under CC BY 4.0: https://www.geonames.org/
-Script 09 extracts only citation-like sentences into a separate SQLite FTS5
-index. Search can then look up citation-context matches by city phrase without
-scanning or splitting candidate article text at runtime.
-Script 10 is a one-time link-data job. It counts links from all normal
-Wikipedia articles to normal Wikipedia articles, then writes only Local
-History targets to `article_link_counts.parquet`. It also writes metadata to
-`article_link_counts.json`; neither output is required until link importance
-is added to the runtime ranking. Script 11 imports those scores into the
-production database.
-
-When `article_link_counts.parquet` is present, search loads its incoming-link
-counts once, applies `log1p`, caps them at the 99th percentile, and adds a small
-editorial-prominence bonus to already-retrieved candidates. Link data does not
-create candidates or override local text, quality, and geographic relevance.
-
+Script 09 extracts citation-like sentences into a separate SQLite FTS5 index
+for optional downstream analysis; the main search ranking uses the article
+BM25 index directly.
 For deployment, script 11 creates `local_history_runtime.sqlite`, which
-contains the article search tables, article FTS index, citation FTS index, and
-article importance scores. The API automatically prefers this finalized
-database when it exists. The raw search database, citation database, link-count
-Parquet file, and large preprocessing artifacts do not need to be deployed.
+contains the article search tables, article FTS index, and citation FTS index.
+Script 12 creates the separate FAISS dense-retrieval index. The API
+automatically prefers the finalized SQLite database when it exists. The raw
+search database, citation database, and large preprocessing artifacts do not
+need to be deployed.
 The embedding `.npy` files remain separate because they are memory-mapped at
 query time. `runtime_manifest.json` records the production snapshot metadata.
 

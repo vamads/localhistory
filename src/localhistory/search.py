@@ -1,16 +1,12 @@
-"""
-search.py
+"""Retrieval and ranking for local-history articles.
 
-Hybrid local history search combining:
-  1. Coordinate proximity   — articles within radius_km of user location
-  2. BM25 retrieval          — fallback for articles without coordinates
-  3. Scoring & ranking      — BM25, distance, entity class, hop, date
-
+The live pipeline combines SQLite coordinate/BM25 retrieval with FAISS dense
+retrieval, fuses those rankings, applies local-history relevance features, and
+uses a cross-encoder to rerank the top text candidates.
 """
 
 import math
 import os
-import re
 import sqlite3
 import pandas as pd
 import numpy as np
@@ -18,11 +14,9 @@ from pathlib import Path
 from functools import lru_cache
 
 try:
-    from .city_queries import precomputed_city_embedding, resolve_city_query
-    from .citation_index import CITATION_HEURISTIC_VERSION
+    from .city_queries import precomputed_city_embedding
 except ImportError:  # Support running search.py/profile_search.py as scripts.
-    from localhistory.city_queries import precomputed_city_embedding, resolve_city_query
-    from localhistory.citation_index import CITATION_HEURISTIC_VERSION
+    from localhistory.city_queries import precomputed_city_embedding
 
 def resolve_data_dir() -> Path:
     """Return the data directory, allowing local or deployed configuration."""
@@ -45,18 +39,16 @@ RUNTIME_DATABASE_PATH = DATA_DIR / "local_history_runtime.sqlite"
 SQLITE_SEARCH_PATH = (
     RUNTIME_DATABASE_PATH if RUNTIME_DATABASE_PATH.exists() else BASE_SEARCH_PATH
 )
-CITATION_INDEX_PATH = (
-    SQLITE_SEARCH_PATH
-    if SQLITE_SEARCH_PATH == RUNTIME_DATABASE_PATH
-    else DATA_DIR / "local_history_citations.sqlite"
-)
 KALM_EMBEDDING_MATRIX_PATH = DATA_DIR / "kalm_embeddings.npy"
 KALM_EMBEDDING_PAGE_IDS_PATH = DATA_DIR / "kalm_embedding_page_ids.npy"
 FAISS_INDEX_PATH = DATA_DIR / "kalm_embeddings.faiss"
-LINK_COUNTS_PATH = DATA_DIR / "article_link_counts.parquet"
 KALM_MODEL_NAME = "KaLM-Embedding/KaLM-embedding-multilingual-mini-instruct-v2.5"
 RERANKER_MODEL_NAME = "BAAI/bge-reranker-v2-m3"
+
+# Ranking configuration. Keep retrieval limits separate from model settings so
+# search quality/latency experiments only require changing this section.
 RRF_K = 60
+DEFAULT_DENSE_TOP_K = 200
 RERANKER_TOP_K = 50
 RERANKER_WEIGHT = 5.0
 ARTICLE_COLUMNS = """
@@ -83,24 +75,27 @@ def load_candidate_index(
     user_lon: float,
     radius_km: float,
 ) -> pd.DataFrame:
-    """Load the union of geographically nearby and qualified text candidates."""
+    """Load text matches plus nearby candidates for later text filtering."""
     require_current_index(
         SQLITE_SEARCH_PATH,
         INDEX_PATH,
         "python preprocessing/05_build_sqlite_search.py --overwrite",
     )
     text_candidates = load_sqlite_text_candidates(location_name)
+    text_candidates["query_text_match"] = True
     nearby_candidates = load_sqlite_coordinate_candidates(
         user_lat,
         user_lon,
         radius_km,
     )
+    nearby_candidates["query_text_match"] = False
     candidates = pd.concat([text_candidates, nearby_candidates]).drop_duplicates(
         subset="page_id",
         keep="first",
     )
     for column in (
         "is_list_article",
+        "query_text_match",
         "exact_title_match",
         "lead_exact_match",
         "exact_full_text_match",
@@ -120,135 +115,18 @@ def require_current_index(path: Path, source: Path, build_command: str) -> None:
         raise RuntimeError(f"Stale search index: {path}\nRun: {build_command}")
 
 
-@lru_cache(maxsize=1)
-def load_editorial_importance() -> pd.Series:
-    """Load capped log incoming-link scores for optional secondary ranking.
-
-    The link-count job scans all normal Wikipedia article links but stores
-    only Local History targets. Missing link data is treated as a zero score
-    so search remains usable while the one-time preprocessing job is running.
-    """
-    if RUNTIME_DATABASE_PATH.exists():
-        database_uri = f"file:{RUNTIME_DATABASE_PATH}?mode=ro&immutable=1"
-        with sqlite3.connect(database_uri, uri=True) as connection:
-            rows = connection.execute(
-                "SELECT page_id, editorial_importance FROM article_importance"
-            ).fetchall()
-        if not rows:
-            return pd.Series(dtype="float64", name="editorial_importance")
-        return pd.Series(
-            [float(score) for _, score in rows],
-            index=[int(page_id) for page_id, _ in rows],
-            name="editorial_importance",
-        )
-
-    if not LINK_COUNTS_PATH.exists():
-        return pd.Series(dtype="float64", name="editorial_importance")
-
-    counts = pd.read_parquet(
-        LINK_COUNTS_PATH,
-        columns=["page_id", "incoming_link_count"],
-    )
-    counts["page_id"] = pd.to_numeric(counts["page_id"], errors="coerce")
-    counts["incoming_link_count"] = pd.to_numeric(
-        counts["incoming_link_count"], errors="coerce"
-    ).fillna(0.0).clip(lower=0.0)
-    counts = counts.dropna(subset=["page_id"]).drop_duplicates("page_id")
-
-    log_counts = np.log1p(counts["incoming_link_count"].to_numpy(dtype="float64"))
-    cap = float(np.quantile(log_counts, 0.99)) if len(log_counts) else 0.0
-    if cap <= 0.0:
-        scores = np.zeros(len(counts), dtype="float64")
-    else:
-        scores = np.clip(log_counts / cap, 0.0, 1.0)
-
-    return pd.Series(
-        scores,
-        index=counts["page_id"].astype("int64").to_numpy(),
-        name="editorial_importance",
-    )
-
-
 def quote_fts_phrase(value: str) -> str:
     return '"' + value.strip().lower().replace('"', '""') + '"'
 
 
-def qualified_location_phrases(location_name: str) -> tuple[str, ...]:
-    """Build exact FTS phrases for a city paired with state/country aliases."""
-    parts = [part.strip() for part in location_name.split(",") if part.strip()]
-    city = resolve_city_query(location_name)
-    city_names = [parts[0]] if parts else []
-    qualifiers = parts[1:]
-    if city is not None:
-        canonical_parts = [
-            part.strip()
-            for part in city.canonical_query.split(",")
-            if part.strip()
-        ]
-        city_names.extend([city.name, canonical_parts[0]])
-        qualifiers.extend(canonical_parts[1:])
-        if city.admin1_name:
-            qualifiers.extend([city.admin1_name, city.admin1_code])
-
-    phrases = {
-        quote_fts_phrase(f"{name} {qualifier}")
-        for name in city_names
-        for qualifier in qualifiers
-        if name and qualifier
-    }
-    if not phrases:
-        raise ValueError(f"A state or country is required to search for {location_name!r}")
-    return tuple(sorted(phrases))
-
-
-@lru_cache(maxsize=32)
-def load_citation_counts(location_name: str) -> dict[int, int]:
-    """Return citation-sentence matches from the required FTS5 index."""
-    require_current_index(
-        CITATION_INDEX_PATH,
-        SQLITE_SEARCH_PATH,
-        "python preprocessing/09_build_citation_index.py --overwrite",
-    )
-
-    database_uri = f"file:{CITATION_INDEX_PATH}?mode=ro&immutable=1"
-    query = """
-        SELECT
-            CAST(page_id AS INTEGER) AS page_id,
-            MIN(2, count(*)) AS context_count
-        FROM citation_fts
-        WHERE citation_fts MATCH ?
-        GROUP BY page_id
-    """
-    with sqlite3.connect(database_uri, uri=True) as connection:
-        metadata = dict(connection.execute("SELECT key, value FROM metadata"))
-        source_stat = SQLITE_SEARCH_PATH.stat()
-        stale = metadata.get("citation_heuristic_version") != CITATION_HEURISTIC_VERSION
-        if CITATION_INDEX_PATH != SQLITE_SEARCH_PATH:
-            stale = stale or (
-                metadata.get("source_size") != str(source_stat.st_size)
-                or metadata.get("source_mtime_ns") != str(source_stat.st_mtime_ns)
-            )
-        if stale:
-            raise RuntimeError(
-                f"Stale citation index: {CITATION_INDEX_PATH}\n"
-                "Run: python preprocessing/09_build_citation_index.py --overwrite"
-            )
-        rows = connection.execute(
-            query,
-            [quote_fts_phrase(location_name.split(",", 1)[0])],
-        ).fetchall()
-    return {int(page_id): int(count) for page_id, count in rows}
-
-
 def load_sqlite_text_candidates(location_name: str) -> pd.DataFrame:
-    """Retrieve articles containing a qualified place phrase."""
+    """Retrieve articles containing the city phrase in any FTS field."""
     database_uri = f"file:{SQLITE_SEARCH_PATH}?mode=ro&immutable=1"
-    phrases = qualified_location_phrases(location_name)
-    match_query = " OR ".join(phrases)
+    phrase = quote_fts_phrase(location_name.split(",", 1)[0].strip())
     query = f"""
         SELECT
             {ARTICLE_COLUMNS},
-            -bm25(article_fts, 10.0, 3.0, 1.0) AS bm25_score
+            -bm25(article_fts, 1.0, 1.0, 1.0) AS bm25_score
         FROM article_fts
         JOIN articles ON articles.page_id = article_fts.rowid
         WHERE article_fts MATCH ?
@@ -259,7 +137,7 @@ def load_sqlite_text_candidates(location_name: str) -> pd.DataFrame:
         candidates = pd.read_sql_query(
             query,
             connection,
-            params=[match_query],
+            params=[phrase],
         )
         for fts_column, result_column in (
             ("title", "exact_title_match"),
@@ -268,7 +146,7 @@ def load_sqlite_text_candidates(location_name: str) -> pd.DataFrame:
         ):
             matches = connection.execute(
                 "SELECT rowid FROM article_fts WHERE article_fts MATCH ?",
-                [" OR ".join(f"{fts_column} : {phrase}" for phrase in phrases)],
+                [f"{fts_column} : {phrase}"],
             )
             page_ids = {page_id for (page_id,) in matches}
             candidates[result_column] = candidates["page_id"].isin(page_ids)
@@ -424,7 +302,7 @@ def query_embedding(location_name: str) -> np.ndarray | None:
     query_embedding = precomputed_city_embedding(location_name)
     if query_embedding is not None:
         return query_embedding
-    # A qualified place query still has an exact FTS/BM25 path. Do not make
+    # A place query still has an exact FTS/BM25 path. Do not make
     # it depend on downloading the optional semantic model.
     if "," in location_name:
         return None
@@ -440,7 +318,7 @@ def query_embedding(location_name: str) -> np.ndarray | None:
 
 
 @lru_cache(maxsize=16)
-def kalm_scores(
+def dense_scores(
     location_name: str,
     target_page_ids: tuple[int, ...],
 ) -> pd.Series:
@@ -488,7 +366,7 @@ def dense_retrieve_page_ids(
     location_name: str,
     top_k: int,
 ) -> pd.DataFrame:
-    """Retrieve the top articles by scoring the complete embedding matrix."""
+    """Retrieve top articles with FAISS, falling back to NumPy."""
     query_vector = query_embedding(location_name)
     if query_vector is None:
         return pd.DataFrame(columns=["page_id", "dense_score"])
@@ -577,34 +455,6 @@ def reciprocal_rank_fusion(
     return result.head(top_n).reset_index(drop=True) if top_n else result.reset_index(drop=True)
 
 
-def place_occurrence_features(
-    frame: pd.DataFrame,
-    location_name: str,
-) -> pd.DataFrame:
-    """Score where and how often the city appears in title and lead text."""
-    city = location_name.split(",", 1)[0].strip().casefold()
-    if not city:
-        frame["place_title_mentions"] = 0
-        frame["place_lead_mentions"] = 0
-        frame["place_position_score"] = 0.0
-        return frame
-
-    pattern = re.compile(rf"(?<!\w){re.escape(city)}(?!\w)")
-    titles = frame["title"].fillna("").astype(str).str.casefold()
-    leads = frame["first_paragraph"].fillna("").astype(str).str.casefold()
-    frame["place_title_mentions"] = titles.str.count(pattern)
-    frame["place_lead_mentions"] = leads.str.count(pattern)
-
-    def first_position(value: str) -> float:
-        match = pattern.search(value)
-        if match is None:
-            return 0.0
-        return 1.0 - (match.start() / max(len(value), 1))
-
-    frame["place_position_score"] = leads.map(first_position)
-    return frame
-
-
 def article_quality_features(frame: pd.DataFrame) -> pd.DataFrame:
     """Build modest quality signals from article shape and metadata."""
     first_length = pd.to_numeric(
@@ -624,16 +474,9 @@ def article_quality_features(frame: pd.DataFrame) -> pd.DataFrame:
     )
     stub_like = (first_length < 160) & (full_length < 800)
     substantive_lead = (first_length >= 240).astype(float)
-    incidental_mention = (
-        frame["exact_full_text_match"]
-        & ~frame["exact_title_match"]
-        & ~frame["lead_exact_match"]
-    )
-
     frame["quality_score"] = (
         -5.0 * frame["is_list_article"].astype(float)
         -2.5 * stub_like.astype(float)
-        -1.5 * incidental_mention.astype(float)
         +0.75 * recognized_type
         +0.2 * metadata_score
         +1.0 * substantive_lead
@@ -648,27 +491,20 @@ def prepare_search_features(
     frame: pd.DataFrame,
     location_name: str,
 ) -> tuple[pd.DataFrame, pd.Series]:
-    """Add shared text, quality, citation, and normalized score features."""
-    frame = article_quality_features(place_occurrence_features(frame.copy(), location_name))
+    """Add quality and normalized BM25/dense score features."""
+    for column in (
+        "is_list_article",
+        "query_text_match",
+        "exact_title_match",
+        "lead_exact_match",
+        "exact_full_text_match",
+    ):
+        frame[column] = frame[column].fillna(False).astype(bool)
+    frame = article_quality_features(frame.copy())
     frame["bm25_score"] = pd.to_numeric(frame["bm25_score"], errors="coerce").fillna(0.0)
-    frame["exact_score"] = (
-        10 * frame["exact_title_match"].astype(float)
-        + 3 * frame["exact_full_text_match"].astype(float)
-    )
-    text_match = (
-        frame["exact_title_match"]
-        | frame["lead_exact_match"]
-        | frame["exact_full_text_match"]
-    )
-    citation_counts = load_citation_counts(location_name)
-    frame["citation_context_count"] = frame["page_id"].map(citation_counts).fillna(0).astype("int8")
-    frame["citation_penalty"] = np.where(
-        frame["exact_title_match"] | frame["lead_exact_match"],
-        0.0,
-        np.minimum(8.0, 4.0 * frame["citation_context_count"]),
-    )
+    text_match = frame["query_text_match"]
     frame["kalm_score"] = frame["page_id"].map(
-        kalm_scores(location_name, tuple(frame.loc[text_match, "page_id"].tolist()))
+        dense_scores(location_name, tuple(frame.loc[text_match, "page_id"].tolist()))
     ).fillna(0.0)
     frame["dense_score"] = pd.to_numeric(
         frame.get("dense_score", np.nan), errors="coerce"
@@ -731,10 +567,10 @@ def retrieve_bm25_candidates(
 
 def retrieve_dense_candidates(
     location_name: str,
-    kalm_top_k: int,
+    dense_top_k: int,
 ) -> pd.DataFrame:
-    """Retrieve top candidates by scoring the full article matrix."""
-    ranking = dense_retrieve_page_ids(location_name, kalm_top_k)
+    """Retrieve top candidates from the FAISS dense index."""
+    ranking = dense_retrieve_page_ids(location_name, dense_top_k)
     candidates = load_sqlite_page_candidates(ranking["page_id"].astype(int).tolist())
     if candidates.empty:
         return candidates
@@ -770,22 +606,13 @@ def fuse_text_retrieval_ranks(
 def score_candidates(frame: pd.DataFrame, radius_km: float) -> pd.DataFrame:
     """Apply the current text-led ranking policy to retrieved candidates."""
     frame = frame.copy()
-    editorial_importance = load_editorial_importance()
-    frame["editorial_importance"] = frame["page_id"].map(editorial_importance).fillna(0.0)
     # RRF scores are small (roughly 0.01–0.03 for k=60), so scale them into
     # the same practical range as the other ranking signals. The rank fusion
     # itself remains independent of raw BM25/cosine score magnitudes.
     score = 100 * frame["rrf_score"].fillna(0.0)
-    score += frame["exact_score"].astype(float) - frame["citation_penalty"]
-    score += (
-        8 * frame["place_title_mentions"]
-        + 5 * frame["place_lead_mentions"]
-        + 2 * np.log1p(frame["place_title_mentions"] + frame["place_lead_mentions"])
-        + 4 * frame["place_position_score"]
-    )
     score += (0.5 * (1 - frame["distance_km"] / max(radius_km, 1.0))).clip(lower=0).fillna(0)
     score += ((5 - frame["hop"]) * 2).fillna(0)
-    score += frame["quality_score"] + 0.25 * frame["editorial_importance"]
+    score += frame["quality_score"]
     frame["score"] = score
     return frame
 
@@ -852,7 +679,7 @@ def search_local_history(
     radius_km: float = 50.0,
     top_n: int = 30,
     bm25_min_score: float = 1.0,
-    kalm_top_k: int = 200,
+    dense_top_k: int = DEFAULT_DENSE_TOP_K,
     index: pd.DataFrame = None,
 ) -> dict:
     if index is None:
@@ -863,7 +690,7 @@ def search_local_history(
             radius_km,
         )
 
-    dense_index = retrieve_dense_candidates(location_name, kalm_top_k)
+    dense_index = retrieve_dense_candidates(location_name, dense_top_k)
     dense_scores = (
         dense_index[["page_id", "dense_score"]]
         if not dense_index.empty
@@ -872,6 +699,8 @@ def search_local_history(
     combined_index = pd.concat([index, dense_index], ignore_index=True).drop_duplicates(
         subset="page_id", keep="first"
     )
+    combined_index["query_text_match"] = combined_index["query_text_match"].fillna(False).astype(bool)
+    combined_index = combined_index[combined_index["query_text_match"]].copy()
     combined_index = combined_index.drop(columns=["source", "distance_km"], errors="ignore")
     combined_index = combined_index.drop(columns=["dense_score"], errors="ignore").merge(
         dense_scores, on="page_id", how="left"

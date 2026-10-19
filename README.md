@@ -158,10 +158,12 @@ ranking across title, first paragraph, and full text. The SQLite indexes are req
 at runtime; search reports the appropriate rebuild command if one is missing
 or stale. Article details and map coordinates are also read from this database,
 so the web API does not load the Parquet article index at runtime.
-Candidate retrieval starts with articles containing the city phrase somewhere
-in the indexed title, first paragraph, or full text. Nearby coordinates are
-used to rank those text-matching articles geographically; articles that do not
-contain the query phrase are not ranked.
+Candidate retrieval first searches the full city/state phrase. If that strict
+search returns fewer than five articles, it adds city-only matches as a lower-
+priority fallback. Within each query tier, BM25 weights title, first paragraph,
+and full text equally. Nearby coordinates are used to rank text-matching
+articles geographically; articles that do not contain the city phrase are not
+ranked.
 Script 06 generates resumable KaLM first-paragraph embedding checkpoints.
 Script 07 converts those checkpoints into a sorted NumPy memory map. Script 12
 builds an exact FAISS inner-product index for dense retrieval. Search uses

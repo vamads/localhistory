@@ -17,7 +17,7 @@ from pydantic import BaseModel
 
 from .city_queries import resolve_city_query
 from .search import SQLITE_SEARCH_PATH, search_local_history
-from .text import clean_article_text
+from .text import article_lead, clean_article_text
 
 
 logger = logging.getLogger("localhistory.api")
@@ -252,7 +252,7 @@ def article(page_id: int) -> ArticleDetail:
     return ArticleDetail(
         page_id=page_id,
         title=clean_text(title),
-        first_paragraph=clean_article_text(first_paragraph),
+        first_paragraph=article_lead(first_paragraph, full_text),
         full_text=clean_article_text(full_text),
         entity_class=clean_text(entity_class, "other"),
         year=finite_int(year),

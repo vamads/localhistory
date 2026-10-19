@@ -49,6 +49,7 @@ RERANKER_MODEL_NAME = "BAAI/bge-reranker-v2-m3"
 # search quality/latency experiments only require changing this section.
 RRF_K = 60
 DEFAULT_DENSE_TOP_K = 200
+STRICT_MATCH_MINIMUM = 5
 RERANKER_TOP_K = 50
 RERANKER_WEIGHT = 5.0
 ARTICLE_COLUMNS = """
@@ -89,6 +90,7 @@ def load_candidate_index(
         radius_km,
     )
     nearby_candidates["query_text_match"] = False
+    nearby_candidates["query_match_tier"] = 0
     candidates = pd.concat([text_candidates, nearby_candidates]).drop_duplicates(
         subset="page_id",
         keep="first",
@@ -96,6 +98,7 @@ def load_candidate_index(
     for column in (
         "is_list_article",
         "query_text_match",
+        "query_match_tier",
         "exact_title_match",
         "lead_exact_match",
         "exact_full_text_match",
@@ -120,25 +123,37 @@ def quote_fts_phrase(value: str) -> str:
 
 
 def load_sqlite_text_candidates(location_name: str) -> pd.DataFrame:
-    """Retrieve articles containing the city phrase in any FTS field."""
+    """Retrieve strict city/state matches, with a city-only fallback when sparse."""
     database_uri = f"file:{SQLITE_SEARCH_PATH}?mode=ro&immutable=1"
-    phrase = quote_fts_phrase(location_name.split(",", 1)[0].strip())
-    query = f"""
-        SELECT
-            {ARTICLE_COLUMNS},
-            -bm25(article_fts, 1.0, 1.0, 1.0) AS bm25_score
-        FROM article_fts
-        JOIN articles ON articles.page_id = article_fts.rowid
-        WHERE article_fts MATCH ?
-          AND NOT articles.is_redirect
-        ORDER BY articles.page_id
-    """
+    parts = [part.strip() for part in location_name.split(",") if part.strip()]
+    city_phrase = quote_fts_phrase(parts[0])
+    strict_phrase = quote_fts_phrase(" ".join(parts))
+    qualified_terms = " AND ".join(quote_fts_phrase(part) for part in parts)
+
+    def run_query(connection: sqlite3.Connection, phrase: str) -> pd.DataFrame:
+        query = f"""
+            SELECT
+                {ARTICLE_COLUMNS},
+                -bm25(article_fts, 1.0, 1.0, 1.0) AS bm25_score
+            FROM article_fts
+            JOIN articles ON articles.page_id = article_fts.rowid
+            WHERE article_fts MATCH ?
+              AND NOT articles.is_redirect
+            ORDER BY articles.page_id
+        """
+        return pd.read_sql_query(query, connection, params=[phrase])
+
     with sqlite3.connect(database_uri, uri=True) as connection:
-        candidates = pd.read_sql_query(
-            query,
-            connection,
-            params=[phrase],
-        )
+        strict = run_query(connection, strict_phrase)
+        strict["query_match_tier"] = 2
+        if len(strict) < STRICT_MATCH_MINIMUM and city_phrase != strict_phrase:
+            relaxed = run_query(connection, qualified_terms)
+            relaxed["query_match_tier"] = 1
+            candidates = pd.concat([strict, relaxed], ignore_index=True).drop_duplicates(
+                subset="page_id", keep="first"
+            )
+        else:
+            candidates = strict
         for fts_column, result_column in (
             ("title", "exact_title_match"),
             ("first_paragraph", "lead_exact_match"),
@@ -146,7 +161,7 @@ def load_sqlite_text_candidates(location_name: str) -> pd.DataFrame:
         ):
             matches = connection.execute(
                 "SELECT rowid FROM article_fts WHERE article_fts MATCH ?",
-                [f"{fts_column} : {phrase}"],
+                [f"{fts_column} : {city_phrase}"],
             )
             page_ids = {page_id for (page_id,) in matches}
             candidates[result_column] = candidates["page_id"].isin(page_ids)
@@ -280,6 +295,13 @@ def load_kalm_embeddings():
 @lru_cache(maxsize=1)
 def load_faiss_index():
     """Load the persisted exact inner-product index for dense retrieval."""
+    if os.getenv("LOCAL_HISTORY_USE_FAISS", "1").casefold() in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }:
+        return None
     if not FAISS_INDEX_PATH.exists():
         return None
     try:
@@ -591,16 +613,25 @@ def fuse_text_retrieval_ranks(
     *,
     k: int = 60,
 ) -> pd.DataFrame:
-    """Build independently ranked BM25/KALM lists and fuse them with RRF."""
+    """Fuse strict BM25, fallback BM25, and dense rankings with RRF."""
+    strict_bm25 = bm25_candidates[bm25_candidates["query_match_tier"] == 2]
+    relaxed_bm25 = bm25_candidates[bm25_candidates["query_match_tier"] == 1]
     rankings = {
-        "bm25": bm25_candidates.sort_values(
+        "bm25_strict": strict_bm25.sort_values(
+            "bm25_score", ascending=False, kind="stable"
+        )[["page_id"]],
+        "bm25_relaxed": relaxed_bm25.sort_values(
             "bm25_score", ascending=False, kind="stable"
         )[["page_id"]],
         "kalm": dense_candidates.sort_values(
             "dense_score", ascending=False, kind="stable"
         )[["page_id"]],
     }
-    return reciprocal_rank_fusion(rankings, k=k)
+    return reciprocal_rank_fusion(
+        rankings,
+        k=k,
+        weights={"bm25_strict": 4.0, "bm25_relaxed": 1.0, "kalm": 1.0},
+    )
 
 
 def score_candidates(frame: pd.DataFrame, radius_km: float) -> pd.DataFrame:
@@ -609,11 +640,16 @@ def score_candidates(frame: pd.DataFrame, radius_km: float) -> pd.DataFrame:
     # RRF scores are small (roughly 0.01–0.03 for k=60), so scale them into
     # the same practical range as the other ranking signals. The rank fusion
     # itself remains independent of raw BM25/cosine score magnitudes.
-    score = 100 * frame["rrf_score"].fillna(0.0)
-    score += (0.5 * (1 - frame["distance_km"] / max(radius_km, 1.0))).clip(lower=0).fillna(0)
-    score += ((5 - frame["hop"]) * 2).fillna(0)
-    score += frame["quality_score"]
-    frame["score"] = score
+    score = 100 * pd.to_numeric(
+        frame["rrf_score"], errors="coerce"
+    ).fillna(0.0)
+    distance_km = pd.to_numeric(frame["distance_km"], errors="coerce")
+    hop = pd.to_numeric(frame["hop"], errors="coerce")
+    quality = pd.to_numeric(frame["quality_score"], errors="coerce").fillna(0.0)
+    score += (0.5 * (1 - distance_km / max(radius_km, 1.0))).clip(lower=0).fillna(0)
+    score += ((5 - hop) * 2).fillna(0)
+    score += quality
+    frame["score"] = pd.to_numeric(score, errors="coerce").fillna(0.0).astype(float)
     return frame
 
 

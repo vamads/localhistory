@@ -40,7 +40,7 @@ data = [
 ]
 dev = [
     "jupyter",
-    "pytest",
+    "pytest>=8.0",
 ]
 
 [tool.setuptools.packages.find]

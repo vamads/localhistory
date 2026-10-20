@@ -1463,7 +1463,7 @@ requires-dist = [
     { name = "pyarrow", marker = "extra == 'preprocessing'" },
     { name = "pyspark", marker = "extra == 'data'" },
     { name = "pyspark", marker = "extra == 'preprocessing'" },
-    { name = "pytest", marker = "extra == 'dev'" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "requests" },
     { name = "sentence-transformers", marker = "extra == 'preprocessing'" },
     { name = "sentence-transformers", marker = "extra == 'semantic'" },

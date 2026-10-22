@@ -49,7 +49,6 @@ RERANKER_MODEL_NAME = "BAAI/bge-reranker-v2-m3"
 # search quality/latency experiments only require changing this section.
 RRF_K = 60
 DEFAULT_DENSE_TOP_K = 200
-STRICT_MATCH_MINIMUM = 5
 RERANKER_TOP_K = 50
 RERANKER_WEIGHT = 5.0
 ARTICLE_COLUMNS = """
@@ -62,6 +61,7 @@ ARTICLE_COLUMNS = """
     articles.lat,
     articles.lon,
     articles.country,
+    articles.location,
     articles.wikidata_id,
     articles.hop,
     articles.year,
@@ -84,6 +84,8 @@ def load_candidate_index(
     )
     text_candidates = load_sqlite_text_candidates(location_name)
     text_candidates["query_text_match"] = True
+    entity_candidates = load_sqlite_entity_candidates(location_name)
+    entity_candidates["query_text_match"] = True
     nearby_candidates = load_sqlite_coordinate_candidates(
         user_lat,
         user_lon,
@@ -91,19 +93,30 @@ def load_candidate_index(
     )
     nearby_candidates["query_text_match"] = False
     nearby_candidates["query_match_tier"] = 0
-    candidates = pd.concat([text_candidates, nearby_candidates]).drop_duplicates(
+    candidates = pd.concat(
+        [text_candidates, entity_candidates, nearby_candidates]
+    ).drop_duplicates(
         subset="page_id",
         keep="first",
     )
     for column in (
         "is_list_article",
         "query_text_match",
-        "query_match_tier",
         "exact_title_match",
         "lead_exact_match",
         "exact_full_text_match",
+        "entity_associated",
     ):
-        candidates[column] = candidates[column].astype(bool)
+        values = candidates.get(
+            column,
+            pd.Series(False, index=candidates.index, dtype=bool),
+        )
+        candidates[column] = values.fillna(False).astype(bool)
+    candidates["query_match_tier"] = (
+        pd.to_numeric(candidates["query_match_tier"], errors="coerce")
+        .fillna(0)
+        .astype(int)
+    )
     return candidates.reset_index(drop=True)
 
 
@@ -123,7 +136,13 @@ def quote_fts_phrase(value: str) -> str:
 
 
 def load_sqlite_text_candidates(location_name: str) -> pd.DataFrame:
-    """Retrieve strict city/state matches, with a city-only fallback when sparse."""
+    """Retrieve exact-phrase and unordered city/qualifier matches.
+
+    City-only lexical retrieval is deliberately excluded because a bare city
+    name can be ambiguous. Exact phrase matches receive the stronger tier, but
+    unordered terms are always retained rather than used only as a sparse
+    fallback.
+    """
     database_uri = f"file:{SQLITE_SEARCH_PATH}?mode=ro&immutable=1"
     parts = [part.strip() for part in location_name.split(",") if part.strip()]
     city_phrase = quote_fts_phrase(parts[0])
@@ -146,14 +165,12 @@ def load_sqlite_text_candidates(location_name: str) -> pd.DataFrame:
     with sqlite3.connect(database_uri, uri=True) as connection:
         strict = run_query(connection, strict_phrase)
         strict["query_match_tier"] = 2
-        if len(strict) < STRICT_MATCH_MINIMUM and city_phrase != strict_phrase:
-            relaxed = run_query(connection, qualified_terms)
-            relaxed["query_match_tier"] = 1
-            candidates = pd.concat([strict, relaxed], ignore_index=True).drop_duplicates(
-                subset="page_id", keep="first"
-            )
-        else:
-            candidates = strict
+        relaxed = run_query(connection, qualified_terms)
+        relaxed["query_match_tier"] = 1
+        candidates = pd.concat([strict, relaxed], ignore_index=True).drop_duplicates(
+            subset="page_id", keep="first"
+        )
+        candidates["entity_associated"] = False
         for fts_column, result_column in (
             ("title", "exact_title_match"),
             ("first_paragraph", "lead_exact_match"),
@@ -167,6 +184,44 @@ def load_sqlite_text_candidates(location_name: str) -> pd.DataFrame:
             candidates[result_column] = candidates["page_id"].isin(page_ids)
 
     return candidates
+
+
+def load_sqlite_entity_candidates(location_name: str) -> pd.DataFrame:
+    """Retrieve articles whose structured location metadata names the city.
+
+    This is the geographic portion of entity-associated retrieval. Link and
+    category relationships are not present in the current runtime database;
+    they can be added as another branch when those source tables are built.
+    """
+    parts = [part.strip() for part in location_name.split(",") if part.strip()]
+    if not parts:
+        return pd.DataFrame()
+    city = parts[0].casefold()
+    query = f"""
+        SELECT
+            {ARTICLE_COLUMNS},
+            1.0 AS bm25_score,
+            1 AS entity_associated,
+            1 AS query_match_tier,
+            0 AS exact_title_match,
+            0 AS lead_exact_match,
+            0 AS exact_full_text_match
+        FROM articles
+        WHERE NOT articles.is_redirect
+          AND (
+                lower(COALESCE(articles.location, '')) = ?
+             OR lower(COALESCE(articles.location, '')) LIKE ?
+             OR lower(COALESCE(articles.location, '')) LIKE ?
+             OR lower(COALESCE(articles.location, '')) LIKE ?
+          )
+    """
+    database_uri = f"file:{SQLITE_SEARCH_PATH}?mode=ro&immutable=1"
+    with sqlite3.connect(database_uri, uri=True) as connection:
+        return pd.read_sql_query(
+            query,
+            connection,
+            params=[city, f"{city} %", f"% {city}", f"% {city},%"],
+        )
 
 
 def load_sqlite_coordinate_candidates(
@@ -736,7 +791,14 @@ def search_local_history(
         subset="page_id", keep="first"
     )
     combined_index["query_text_match"] = combined_index["query_text_match"].fillna(False).astype(bool)
-    combined_index = combined_index[combined_index["query_text_match"]].copy()
+    combined_index["entity_associated"] = (
+        combined_index.get(
+            "entity_associated",
+            pd.Series(False, index=combined_index.index, dtype=bool),
+        )
+        .fillna(False)
+        .astype(bool)
+    )
     combined_index = combined_index.drop(columns=["source", "distance_km"], errors="ignore")
     combined_index = combined_index.drop(columns=["dense_score"], errors="ignore").merge(
         dense_scores, on="page_id", how="left"

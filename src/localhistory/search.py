@@ -7,6 +7,7 @@ uses a cross-encoder to rerank the top text candidates.
 
 import math
 import os
+import re
 import sqlite3
 import pandas as pd
 import numpy as np
@@ -85,7 +86,7 @@ def load_candidate_index(
     text_candidates = load_sqlite_text_candidates(location_name)
     text_candidates["query_text_match"] = True
     entity_candidates = load_sqlite_entity_candidates(location_name)
-    entity_candidates["query_text_match"] = True
+    entity_candidates["query_text_match"] = False
     nearby_candidates = load_sqlite_coordinate_candidates(
         user_lat,
         user_lon,
@@ -93,12 +94,15 @@ def load_candidate_index(
     )
     nearby_candidates["query_text_match"] = False
     nearby_candidates["query_match_tier"] = 0
-    candidates = pd.concat(
+    all_candidates = pd.concat(
         [text_candidates, entity_candidates, nearby_candidates]
-    ).drop_duplicates(
+    )
+    category_scores = all_candidates.groupby("page_id")["category_score"].max()
+    candidates = all_candidates.drop_duplicates(
         subset="page_id",
         keep="first",
     )
+    candidates["category_score"] = candidates["page_id"].map(category_scores).fillna(0.0)
     for column in (
         "is_list_article",
         "query_text_match",
@@ -112,6 +116,13 @@ def load_candidate_index(
             pd.Series(False, index=candidates.index, dtype=bool),
         )
         candidates[column] = values.fillna(False).astype(bool)
+    candidates["category_score"] = pd.to_numeric(
+        candidates.get(
+            "category_score",
+            pd.Series(0.0, index=candidates.index, dtype="float64"),
+        ),
+        errors="coerce",
+    ).fillna(0.0)
     candidates["query_match_tier"] = (
         pd.to_numeric(candidates["query_match_tier"], errors="coerce")
         .fillna(0)
@@ -171,6 +182,7 @@ def load_sqlite_text_candidates(location_name: str) -> pd.DataFrame:
             subset="page_id", keep="first"
         )
         candidates["entity_associated"] = False
+        candidates["category_score"] = 0.0
         for fts_column, result_column in (
             ("title", "exact_title_match"),
             ("first_paragraph", "lead_exact_match"),
@@ -189,15 +201,15 @@ def load_sqlite_text_candidates(location_name: str) -> pd.DataFrame:
 def load_sqlite_entity_candidates(location_name: str) -> pd.DataFrame:
     """Retrieve articles whose structured location metadata names the city.
 
-    This is the geographic portion of entity-associated retrieval. Link and
-    category relationships are not present in the current runtime database;
-    they can be added as another branch when those source tables are built.
+    This uses geographic metadata and article categories. Link relationships
+    are not present in the current extraction artifacts and can be added as a
+    further branch when raw wiki links are retained.
     """
     parts = [part.strip() for part in location_name.split(",") if part.strip()]
     if not parts:
         return pd.DataFrame()
     city = parts[0].casefold()
-    query = f"""
+    location_query = f"""
         SELECT
             {ARTICLE_COLUMNS},
             1.0 AS bm25_score,
@@ -215,13 +227,116 @@ def load_sqlite_entity_candidates(location_name: str) -> pd.DataFrame:
              OR lower(COALESCE(articles.location, '')) LIKE ?
           )
     """
+    category_query = f"""
+        SELECT
+            {ARTICLE_COLUMNS},
+            article_categories.category AS matched_category,
+            1.0 AS bm25_score,
+            1 AS entity_associated,
+            1 AS query_match_tier,
+            0 AS exact_title_match,
+            0 AS lead_exact_match,
+            0 AS exact_full_text_match
+        FROM articles
+        JOIN article_categories
+          ON article_categories.page_id = articles.page_id
+        WHERE NOT articles.is_redirect
+          AND (CATEGORY_MATCH_CONDITION)
+    """
+    qualifiers = [part.casefold() for part in parts[1:]]
+    terms = [city, *qualifiers]
+    category_conditions = []
+    category_params = []
+    for term in terms:
+        category_conditions.append(
+            "("
+            "lower(replace(replace(replace(article_categories.category, '_', ' '), '(', ' '), ')', ' ')) = ? "
+            "OR lower(replace(replace(replace(article_categories.category, '_', ' '), '(', ' '), ')', ' ')) LIKE ? "
+            "OR lower(replace(replace(replace(article_categories.category, '_', ' '), '(', ' '), ')', ' ')) LIKE ? "
+            "OR lower(replace(replace(replace(article_categories.category, '_', ' '), '(', ' '), ')', ' ')) LIKE ? "
+            "OR lower(replace(replace(replace(article_categories.category, '_', ' '), '(', ' '), ')', ' ')) LIKE ?"
+            ")"
+        )
+        category_params.extend(
+            [
+                term,
+                f"{term} %",
+                f"% {term}",
+                f"% {term} %",
+                f"% {term},%",
+            ]
+        )
+    category_query = category_query.replace(
+        "CATEGORY_MATCH_CONDITION",
+        " OR ".join(category_conditions),
+    )
+    location_patterns = [city, f"{city} %", f"% {city}", f"% {city},%"]
     database_uri = f"file:{SQLITE_SEARCH_PATH}?mode=ro&immutable=1"
     with sqlite3.connect(database_uri, uri=True) as connection:
-        return pd.read_sql_query(
-            query,
-            connection,
-            params=[city, f"{city} %", f"% {city}", f"% {city},%"],
+        frames = [
+            pd.read_sql_query(
+                location_query,
+                connection,
+                params=location_patterns,
+            )
+        ]
+        has_categories = connection.execute(
+            """
+            SELECT 1
+            FROM sqlite_master
+            WHERE type = 'table' AND name = 'article_categories'
+            """
+        ).fetchone()
+        if has_categories:
+            frames.append(
+                pd.read_sql_query(
+                    category_query,
+                    connection,
+                    params=category_params,
+                )
+            )
+    candidates = pd.concat(frames, ignore_index=True)
+    candidates["category_score"] = 0.0
+    if "matched_category" in candidates:
+        history_words = re.compile(
+            r"(?:history|historical|medieval|revolution|war|military|"
+            r"political|economic|social|cultural|architecture|timeline|"
+            r"archaeolog|historic)",
+            flags=re.IGNORECASE,
         )
+        city_pattern = re.compile(
+            rf"(?:^|[ _(),-]){re.escape(city)}(?:$|[ _(),-])",
+            flags=re.IGNORECASE,
+        )
+        qualifier_patterns = [
+            re.compile(
+                rf"(?:^|[ _(),-]){re.escape(term)}(?:$|[ _(),-])",
+                flags=re.IGNORECASE,
+            )
+            for term in qualifiers
+        ]
+
+        def category_score(category: object) -> float:
+            value = str(category or "")
+            city_hit = bool(city_pattern.search(value))
+            qualifier_hit = any(pattern.search(value) for pattern in qualifier_patterns)
+            historical = bool(history_words.search(value))
+            if city_hit and historical:
+                return 1.0
+            if city_hit:
+                return 0.75
+            if qualifier_hit and historical:
+                return 0.45
+            if qualifier_hit:
+                return 0.20
+            return 0.0
+
+        candidates["category_score"] = candidates["matched_category"].map(
+            category_score
+        )
+    return candidates.sort_values(
+        "category_score", ascending=False, kind="stable"
+    ).drop_duplicates(subset="page_id", keep="first")
 
 
 def load_sqlite_coordinate_candidates(
@@ -665,10 +780,11 @@ def combine_retrieval_results(*candidate_frames: pd.DataFrame) -> pd.DataFrame:
 def fuse_text_retrieval_ranks(
     bm25_candidates: pd.DataFrame,
     dense_candidates: pd.DataFrame,
+    category_candidates: pd.DataFrame,
     *,
     k: int = 60,
 ) -> pd.DataFrame:
-    """Fuse strict BM25, fallback BM25, and dense rankings with RRF."""
+    """Fuse BM25, dense, and structured category rankings with RRF."""
     strict_bm25 = bm25_candidates[bm25_candidates["query_match_tier"] == 2]
     relaxed_bm25 = bm25_candidates[bm25_candidates["query_match_tier"] == 1]
     rankings = {
@@ -681,11 +797,21 @@ def fuse_text_retrieval_ranks(
         "kalm": dense_candidates.sort_values(
             "dense_score", ascending=False, kind="stable"
         )[["page_id"]],
+        "category": category_candidates.sort_values(
+            ["category_score", "quality_score"],
+            ascending=False,
+            kind="stable",
+        )[["page_id"]],
     }
     return reciprocal_rank_fusion(
         rankings,
         k=k,
-        weights={"bm25_strict": 4.0, "bm25_relaxed": 1.0, "kalm": 1.0},
+        weights={
+            "bm25_strict": 4.0,
+            "bm25_relaxed": 1.0,
+            "kalm": 1.0,
+            "category": 5.0,
+        },
     )
 
 
@@ -701,9 +827,17 @@ def score_candidates(frame: pd.DataFrame, radius_km: float) -> pd.DataFrame:
     distance_km = pd.to_numeric(frame["distance_km"], errors="coerce")
     hop = pd.to_numeric(frame["hop"], errors="coerce")
     quality = pd.to_numeric(frame["quality_score"], errors="coerce").fillna(0.0)
+    category_score = pd.to_numeric(
+        frame.get(
+            "category_score",
+            pd.Series(0.0, index=frame.index, dtype="float64"),
+        ),
+        errors="coerce",
+    ).fillna(0.0)
     score += (0.5 * (1 - distance_km / max(radius_km, 1.0))).clip(lower=0).fillna(0)
     score += ((5 - hop) * 2).fillna(0)
     score += quality
+    score += 4.0 * category_score
     frame["score"] = pd.to_numeric(score, errors="coerce").fillna(0.0).astype(float)
     return frame
 
@@ -818,15 +952,24 @@ def search_local_history(
     ].copy()
     dense_candidates["distance_km"] = np.nan
     dense_candidates["source"] = "dense"
+    category_candidates = features[
+        (features["category_score"] > 0)
+        & ~features["page_id"].isin(nearby_ids)
+        & features["lat"].isna()
+    ].copy()
+    category_candidates["distance_km"] = np.nan
+    category_candidates["source"] = "category"
     rrf_scores = fuse_text_retrieval_ranks(
         bm25_candidates,
         dense_candidates,
+        category_candidates,
         k=RRF_K,
     )
     combined = combine_retrieval_results(
         coordinate_candidates,
         bm25_candidates,
         dense_candidates,
+        category_candidates,
     )
     combined = combined.merge(
         rrf_scores[["page_id", "rrf_score"]],

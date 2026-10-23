@@ -139,6 +139,8 @@ def match_reason(row: pd.Series) -> str:
         return "City in title"
     if row.get("lead_exact_match", False):
         return "City in introduction"
+    if row.get("entity_associated", False):
+        return "City in location metadata"
     if row.get("source") == "coordinates":
         return "Mapped nearby"
     return "City mentioned in article"

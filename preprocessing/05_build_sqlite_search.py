@@ -20,6 +20,7 @@ import sqlite3
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
+import pyarrow.dataset as pads
 
 
 def resolve_data_dir() -> Path:
@@ -36,6 +37,7 @@ def resolve_data_dir() -> Path:
 
 DATA_DIR = resolve_data_dir()
 INDEX_PATH = DATA_DIR / "local_history_index.parquet"
+CATEGORY_PATH = DATA_DIR / "article_categories.parquet"
 DATABASE_PATH = DATA_DIR / "local_history_search.sqlite"
 
 COLUMNS = [
@@ -93,6 +95,13 @@ CREATE TABLE articles (
     entity_class TEXT
 );
 
+CREATE TABLE article_categories (
+    page_id INTEGER NOT NULL,
+    category TEXT NOT NULL,
+    hop INTEGER,
+    PRIMARY KEY (page_id, category)
+);
+
 CREATE VIRTUAL TABLE article_fts USING fts5(
     title,
     first_paragraph,
@@ -125,6 +134,17 @@ def sqlite_value(value):
 def batch_rows(frame: pd.DataFrame):
     for row in frame[COLUMNS].itertuples(index=False, name=None):
         yield tuple(sqlite_value(value) for value in row)
+
+
+def batch_category_rows(frame: pd.DataFrame):
+    """Yield normalized article→category edges for SQLite insertion."""
+    for row in frame[["page_id", "category", "hop"]].itertuples(
+        index=False, name=None
+    ):
+        page_id, category, hop = row
+        if pd.isna(page_id) or pd.isna(category):
+            continue
+        yield int(page_id), str(category), sqlite_value(hop)
 
 
 def build_database(
@@ -200,6 +220,37 @@ def build_database(
             raise RuntimeError(
                 f"Expected {parquet.metadata.num_rows:,} rows, found {article_count:,}"
             )
+
+        if CATEGORY_PATH.exists():
+            print("Importing article→category relationships...")
+            category_inserted = 0
+            category_dataset = pads.dataset(CATEGORY_PATH, format="parquet")
+            for arrow_batch in category_dataset.to_batches(
+                batch_size=batch_size,
+                columns=["page_id", "category", "hop"],
+            ):
+                frame = arrow_batch.to_pandas()
+                connection.executemany(
+                    """
+                    INSERT OR IGNORE INTO article_categories(page_id, category, hop)
+                    VALUES (?, ?, ?)
+                    """,
+                    batch_category_rows(frame),
+                )
+                category_inserted += len(frame)
+            connection.execute(
+                "CREATE INDEX article_categories_category_idx "
+                "ON article_categories(category)"
+            )
+            connection.execute(
+                "CREATE INDEX article_categories_page_id_idx "
+                "ON article_categories(page_id)"
+            )
+            connection.commit()
+            print(f"  imported {category_inserted:,} article→category rows")
+        else:
+            print(f"Warning: category file not found: {CATEGORY_PATH}")
+
         integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
         if integrity != "ok":
             raise RuntimeError(f"SQLite integrity check failed: {integrity}")

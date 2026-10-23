@@ -52,6 +52,9 @@ RRF_K = 60
 DEFAULT_DENSE_TOP_K = 200
 RERANKER_TOP_K = 50
 RERANKER_WEIGHT = 5.0
+METADATA_COMPLETENESS_WEIGHT = float(
+    os.getenv("LOCAL_HISTORY_METADATA_BOOST", "1.5")
+)
 ARTICLE_COLUMNS = """
     articles.page_id,
     articles.title,
@@ -64,6 +67,15 @@ ARTICLE_COLUMNS = """
     articles.country,
     articles.location,
     articles.wikidata_id,
+    articles.instance_of,
+    articles.occupation,
+    articles.birth_date,
+    articles.death_date,
+    articles.inception,
+    articles.dissolved,
+    articles.start_time,
+    articles.end_time,
+    articles.point_in_time,
     articles.hop,
     articles.year,
     articles.entity_class
@@ -648,7 +660,12 @@ def reciprocal_rank_fusion(
 
 
 def article_quality_features(frame: pd.DataFrame) -> pd.DataFrame:
-    """Build modest quality signals from article shape and metadata."""
+    """Build modest quality signals from article shape and metadata.
+
+    Wikidata completeness is treated as a weak importance proxy. The score is
+    normalized within broad entity types so a person is not penalized for
+    lacking coordinates, and it never gates retrieval.
+    """
     first_length = pd.to_numeric(
         frame.get("first_paragraph_length", frame["first_paragraph"].str.len()),
         errors="coerce",
@@ -658,19 +675,72 @@ def article_quality_features(frame: pd.DataFrame) -> pd.DataFrame:
         errors="coerce",
     ).fillna(0)
     recognized_type = frame["entity_class"].ne("other").astype(float)
-    metadata_fields = ["wikidata_id", "country", "year", "lat", "lon"]
-    metadata_score = sum(
-        frame[field].notna().astype(float)
-        for field in metadata_fields
-        if field in frame
-    )
+
+    def populated(column: str) -> pd.Series:
+        values = frame.get(
+            column,
+            pd.Series(None, index=frame.index, dtype="object"),
+        )
+        return values.notna() & values.astype(str).str.strip().isin(
+            {"", "[]", "{}", "null", "None"}
+        ).eq(False)
+
+    common_fields = {
+        "wikidata_id": 1.0,
+        "instance_of": 1.0,
+    }
+    type_fields = {
+        "person": {
+            "occupation": 1.0,
+            "birth_date": 0.6,
+            "death_date": 0.6,
+            "country": 0.4,
+        },
+        "place": {
+            "country": 0.7,
+            "location": 0.7,
+            "lat": 0.5,
+            "lon": 0.5,
+            "inception": 0.4,
+        },
+        "event": {
+            "country": 0.4,
+            "location": 0.4,
+            "start_time": 0.6,
+            "end_time": 0.6,
+            "point_in_time": 0.6,
+        },
+        "work": {
+            "country": 0.4,
+            "inception": 0.6,
+        },
+        "other": {
+            "country": 0.4,
+            "location": 0.4,
+            "inception": 0.4,
+            "point_in_time": 0.4,
+        },
+    }
+    metadata_completeness = pd.Series(0.0, index=frame.index, dtype="float64")
+    metadata_possible = pd.Series(0.0, index=frame.index, dtype="float64")
+    for entity_type, fields in type_fields.items():
+        entity_rows = frame["entity_class"].eq(entity_type)
+        weights = {**common_fields, **fields}
+        possible = float(sum(weights.values()))
+        metadata_possible += entity_rows.astype(float) * possible
+        for field, weight in weights.items():
+            metadata_completeness += (
+                entity_rows.astype(float) * populated(field).astype(float) * weight
+            )
+    metadata_possible = metadata_possible.mask(metadata_possible == 0, 1.0)
+    frame["metadata_completeness"] = metadata_completeness / metadata_possible
     stub_like = (first_length < 160) & (full_length < 800)
     substantive_lead = (first_length >= 240).astype(float)
     frame["quality_score"] = (
         -5.0 * frame["is_list_article"].astype(float)
         -2.5 * stub_like.astype(float)
         +0.75 * recognized_type
-        +0.2 * metadata_score
+        +METADATA_COMPLETENESS_WEIGHT * frame["metadata_completeness"]
         +1.0 * substantive_lead
         -0.75 * (first_length < 80).astype(float)
     )

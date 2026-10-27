@@ -52,6 +52,9 @@ RRF_K = 60
 DEFAULT_DENSE_TOP_K = 200
 RERANKER_TOP_K = 50
 RERANKER_WEIGHT = 5.0
+CITY_IMPORTANCE_POPULATION_THRESHOLD = int(
+    os.getenv("LOCAL_HISTORY_IMPORTANCE_MIN_POPULATION", "200000")
+)
 METADATA_COMPLETENESS_WEIGHT = float(
     os.getenv("LOCAL_HISTORY_METADATA_BOOST", "1.5")
 )
@@ -740,9 +743,11 @@ def article_quality_features(frame: pd.DataFrame) -> pd.DataFrame:
         -5.0 * frame["is_list_article"].astype(float)
         -2.5 * stub_like.astype(float)
         +0.75 * recognized_type
-        +METADATA_COMPLETENESS_WEIGHT * frame["metadata_completeness"]
         +1.0 * substantive_lead
         -0.75 * (first_length < 80).astype(float)
+    )
+    frame["importance_score"] = (
+        METADATA_COMPLETENESS_WEIGHT * frame["metadata_completeness"]
     )
     return frame
 
@@ -885,7 +890,12 @@ def fuse_text_retrieval_ranks(
     )
 
 
-def score_candidates(frame: pd.DataFrame, radius_km: float) -> pd.DataFrame:
+def score_candidates(
+    frame: pd.DataFrame,
+    radius_km: float,
+    *,
+    use_importance: bool = True,
+) -> pd.DataFrame:
     """Apply the current text-led ranking policy to retrieved candidates."""
     frame = frame.copy()
     # RRF scores are small (roughly 0.01–0.03 for k=60), so scale them into
@@ -897,6 +907,13 @@ def score_candidates(frame: pd.DataFrame, radius_km: float) -> pd.DataFrame:
     distance_km = pd.to_numeric(frame["distance_km"], errors="coerce")
     hop = pd.to_numeric(frame["hop"], errors="coerce")
     quality = pd.to_numeric(frame["quality_score"], errors="coerce").fillna(0.0)
+    importance = pd.to_numeric(
+        frame.get(
+            "importance_score",
+            pd.Series(0.0, index=frame.index, dtype="float64"),
+        ),
+        errors="coerce",
+    ).fillna(0.0)
     category_score = pd.to_numeric(
         frame.get(
             "category_score",
@@ -907,6 +924,8 @@ def score_candidates(frame: pd.DataFrame, radius_km: float) -> pd.DataFrame:
     score += (0.5 * (1 - distance_km / max(radius_km, 1.0))).clip(lower=0).fillna(0)
     score += ((5 - hop) * 2).fillna(0)
     score += quality
+    if use_importance:
+        score += importance
     score += 4.0 * category_score
     frame["score"] = pd.to_numeric(score, errors="coerce").fillna(0.0).astype(float)
     return frame
@@ -976,7 +995,14 @@ def search_local_history(
     bm25_min_score: float = 1.0,
     dense_top_k: int = DEFAULT_DENSE_TOP_K,
     index: pd.DataFrame = None,
+    population: int | None = None,
 ) -> dict:
+    """Search a city, using the importance prior only for larger cities.
+
+    The importance prior is deliberately disabled when population is unknown:
+    a missing population should not accidentally turn on a popularity-like
+    ranking signal.
+    """
     if index is None:
         index = load_candidate_index(
             location_name,
@@ -1046,7 +1072,17 @@ def search_local_history(
         on="page_id",
         how="left",
     )
-    scored = score_candidates(combined, radius_km)
+    use_importance = (
+        population is not None
+        and population >= CITY_IMPORTANCE_POPULATION_THRESHOLD
+    )
+    scored = score_candidates(
+        combined,
+        radius_km,
+        use_importance=use_importance,
+    )
     scored = rerank_with_cross_encoder(scored, location_name)
     results, stats = finalize_results(scored, top_n)
+    stats["population"] = population
+    stats["importance_enabled"] = use_importance
     return {"results": results, "stats": stats}

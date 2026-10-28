@@ -1,6 +1,6 @@
 import pandas as pd
 
-from localhistory.search import article_quality_features
+from localhistory.search import article_quality_features, score_candidates
 
 
 def test_metadata_completeness_is_normalized_by_entity_type():
@@ -51,3 +51,25 @@ def test_metadata_completeness_is_normalized_by_entity_type():
 
     assert result.loc[0, "metadata_completeness"] > 0.8
     assert result.loc[1, "metadata_completeness"] > 0.8
+
+
+def test_importance_prior_is_optional_for_small_city_searches():
+    frame = pd.DataFrame(
+        [
+            {
+                "page_id": 1,
+                "rrf_score": 0.1,
+                "distance_km": None,
+                "hop": 5,
+                "quality_score": 0.0,
+                "importance_score": 2.0,
+                "category_score": 0.0,
+            }
+        ]
+    )
+
+    relevance_only = score_candidates(frame, 50.0, use_importance=False)
+    with_importance = score_candidates(frame, 50.0, use_importance=True)
+
+    assert with_importance.loc[0, "score"] > relevance_only.loc[0, "score"]
+    assert with_importance.loc[0, "score"] - relevance_only.loc[0, "score"] == 2.0

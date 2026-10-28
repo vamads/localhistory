@@ -24,7 +24,9 @@ from pathlib import Path
 
 import pandas as pd
 
+from localhistory.city_queries import resolve_city_query
 from localhistory.search import (
+    CITY_IMPORTANCE_POPULATION_THRESHOLD,
     SQLITE_SEARCH_PATH,
     load_candidate_index,
     load_cross_encoder,
@@ -84,6 +86,7 @@ def format_bytes(value: int) -> str:
 def run_search(args: argparse.Namespace, index: pd.DataFrame) -> dict:
     sync_device()
     started = time.perf_counter()
+    resolved_city = resolve_city_query(args.query)
     output = search_local_history(
         location_name=args.query,
         user_lat=args.lat,
@@ -93,6 +96,7 @@ def run_search(args: argparse.Namespace, index: pd.DataFrame) -> dict:
         bm25_min_score=1.0,
         dense_top_k=200,
         index=index,
+        population=resolved_city.population if resolved_city is not None else None,
     )
     sync_device()
     return {
@@ -114,6 +118,12 @@ def main() -> None:
     args = parser.parse_args()
 
     print(f"Index: {SQLITE_SEARCH_PATH}")
+    resolved_city = resolve_city_query(args.query)
+    if resolved_city is not None:
+        print(
+            f"Population: {resolved_city.population:,} "
+            f"(importance prior {'enabled' if resolved_city.population >= CITY_IMPORTANCE_POPULATION_THRESHOLD else 'disabled'})"
+        )
     print(f"Query: {args.query!r} ({args.lat}, {args.lon}), radius={args.radius} km")
     print("Loading matching article candidates...")
     index = load_candidate_index(args.query, args.lat, args.lon, args.radius)

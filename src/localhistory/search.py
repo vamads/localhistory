@@ -37,6 +37,7 @@ DATA_DIR = resolve_data_dir()
 INDEX_PATH = DATA_DIR / "local_history_index.parquet"
 BASE_SEARCH_PATH = DATA_DIR / "local_history_search.sqlite"
 RUNTIME_DATABASE_PATH = DATA_DIR / "local_history_runtime.sqlite"
+CITY_GRAPH_DATABASE_PATH = DATA_DIR / "city_link_graph.sqlite"
 SQLITE_SEARCH_PATH = (
     RUNTIME_DATABASE_PATH if RUNTIME_DATABASE_PATH.exists() else BASE_SEARCH_PATH
 )
@@ -58,6 +59,21 @@ CITY_IMPORTANCE_POPULATION_THRESHOLD = int(
 METADATA_COMPLETENESS_WEIGHT = float(
     os.getenv("LOCAL_HISTORY_METADATA_BOOST", "1.5")
 )
+DEFAULT_RRF_WEIGHTS = {
+    "bm25_strict": 4.0,
+    "bm25_relaxed": 1.0,
+    "kalm": 1.0,
+    "category": 5.0,
+    "graph": 0.0,
+}
+DEFAULT_SCORE_WEIGHTS = {
+    "geographic": 0.5,
+    "hop": 2.0,
+    "quality": 1.0,
+    "importance": 1.0,
+    "category": 4.0,
+    "graph": 0.0,
+}
 ARTICLE_COLUMNS = """
     articles.page_id,
     articles.title,
@@ -847,6 +863,31 @@ def retrieve_dense_candidates(
     return candidates
 
 
+@lru_cache(maxsize=256)
+def load_city_graph_candidates(geoname_id: int | None) -> pd.DataFrame:
+    """Load graph-associated article IDs for a city when available."""
+    columns = ["page_id", "graph_distance", "graph_score"]
+    if geoname_id is None or not CITY_GRAPH_DATABASE_PATH.exists():
+        return pd.DataFrame(columns=columns)
+    with sqlite3.connect(
+        f"file:{CITY_GRAPH_DATABASE_PATH}?mode=ro&immutable=1", uri=True
+    ) as connection:
+        frame = pd.read_sql_query(
+            """
+            SELECT article_page_id AS page_id, MIN(graph_distance) AS graph_distance
+            FROM city_article_graph
+            WHERE geoname_id = ?
+            GROUP BY article_page_id
+            """,
+            connection,
+            params=[int(geoname_id)],
+        )
+    if frame.empty:
+        return pd.DataFrame(columns=columns)
+    frame["graph_score"] = 1.0 / (1.0 + frame["graph_distance"].astype(float))
+    return frame
+
+
 def combine_retrieval_results(*candidate_frames: pd.DataFrame) -> pd.DataFrame:
     """Combine branches, preferring coordinate evidence on overlap."""
     return pd.concat(candidate_frames).drop_duplicates(subset="page_id", keep="first")
@@ -856,8 +897,10 @@ def fuse_text_retrieval_ranks(
     bm25_candidates: pd.DataFrame,
     dense_candidates: pd.DataFrame,
     category_candidates: pd.DataFrame,
+    graph_candidates: pd.DataFrame,
     *,
     k: int = 60,
+    rrf_weights: dict[str, float] | None = None,
 ) -> pd.DataFrame:
     """Fuse BM25, dense, and structured category rankings with RRF."""
     strict_bm25 = bm25_candidates[bm25_candidates["query_match_tier"] == 2]
@@ -877,16 +920,16 @@ def fuse_text_retrieval_ranks(
             ascending=False,
             kind="stable",
         )[["page_id"]],
+        "graph": graph_candidates.sort_values(
+            ["graph_score", "graph_distance"],
+            ascending=[False, True],
+            kind="stable",
+        )[["page_id"]],
     }
     return reciprocal_rank_fusion(
         rankings,
         k=k,
-        weights={
-            "bm25_strict": 4.0,
-            "bm25_relaxed": 1.0,
-            "kalm": 1.0,
-            "category": 5.0,
-        },
+        weights=rrf_weights or DEFAULT_RRF_WEIGHTS,
     )
 
 
@@ -895,9 +938,11 @@ def score_candidates(
     radius_km: float,
     *,
     use_importance: bool = True,
+    score_weights: dict[str, float] | None = None,
 ) -> pd.DataFrame:
     """Apply the current text-led ranking policy to retrieved candidates."""
     frame = frame.copy()
+    weights = {**DEFAULT_SCORE_WEIGHTS, **(score_weights or {})}
     # RRF scores are small (roughly 0.01–0.03 for k=60), so scale them into
     # the same practical range as the other ranking signals. The rank fusion
     # itself remains independent of raw BM25/cosine score magnitudes.
@@ -921,12 +966,23 @@ def score_candidates(
         ),
         errors="coerce",
     ).fillna(0.0)
-    score += (0.5 * (1 - distance_km / max(radius_km, 1.0))).clip(lower=0).fillna(0)
-    score += ((5 - hop) * 2).fillna(0)
-    score += quality
+    graph_score = pd.to_numeric(
+        frame.get(
+            "graph_score",
+            pd.Series(0.0, index=frame.index, dtype="float64"),
+        ),
+        errors="coerce",
+    ).fillna(0.0)
+    score += (
+        weights["geographic"]
+        * (1 - distance_km / max(radius_km, 1.0))
+    ).clip(lower=0).fillna(0)
+    score += ((5 - hop) * weights["hop"]).fillna(0)
+    score += weights["quality"] * quality
     if use_importance:
-        score += importance
-    score += 4.0 * category_score
+        score += weights["importance"] * importance
+    score += weights["category"] * category_score
+    score += weights["graph"] * graph_score
     frame["score"] = pd.to_numeric(score, errors="coerce").fillna(0.0).astype(float)
     return frame
 
@@ -936,6 +992,7 @@ def rerank_with_cross_encoder(
     location_name: str,
     *,
     top_k: int = RERANKER_TOP_K,
+    weight: float = RERANKER_WEIGHT,
 ) -> pd.DataFrame:
     """Rerank the best text candidates after RRF with a cross-encoder."""
     frame = frame.copy()
@@ -966,7 +1023,7 @@ def rerank_with_cross_encoder(
     )
     frame["cross_encoder_score"] = frame["page_id"].map(score_by_page_id)
     reranked = frame["cross_encoder_score"].notna()
-    frame.loc[reranked, "score"] += RERANKER_WEIGHT * normalize_scores(
+    frame.loc[reranked, "score"] += weight * normalize_scores(
         frame.loc[reranked, "cross_encoder_score"]
     )
     return frame
@@ -996,6 +1053,9 @@ def search_local_history(
     dense_top_k: int = DEFAULT_DENSE_TOP_K,
     index: pd.DataFrame = None,
     population: int | None = None,
+    geoname_id: int | None = None,
+    ranking_weights: dict | None = None,
+    rerank: bool = True,
 ) -> dict:
     """Search a city, using the importance prior only for larger cities.
 
@@ -1003,6 +1063,7 @@ def search_local_history(
     a missing population should not accidentally turn on a popularity-like
     ranking signal.
     """
+    ranking_weights = ranking_weights or {}
     if index is None:
         index = load_candidate_index(
             location_name,
@@ -1012,14 +1073,33 @@ def search_local_history(
         )
 
     dense_index = retrieve_dense_candidates(location_name, dense_top_k)
+    graph_index = load_city_graph_candidates(geoname_id)
+    graph_candidates = load_sqlite_page_candidates(
+        graph_index["page_id"].astype(int).tolist()
+    )
+    if not graph_candidates.empty:
+        graph_candidates = graph_candidates.merge(graph_index, on="page_id", how="inner")
+        graph_candidates["distance_km"] = np.nan
+        graph_candidates["source"] = "graph"
     dense_scores = (
         dense_index[["page_id", "dense_score"]]
         if not dense_index.empty
         else pd.DataFrame(columns=["page_id", "dense_score"])
     )
-    combined_index = pd.concat([index, dense_index], ignore_index=True).drop_duplicates(
+    combined_index = pd.concat(
+        [index, dense_index, graph_candidates],
+        ignore_index=True,
+    ).drop_duplicates(
         subset="page_id", keep="first"
     )
+    if not graph_index.empty:
+        graph_by_page = graph_index.set_index("page_id")
+        combined_index["graph_distance"] = combined_index["page_id"].map(
+            graph_by_page["graph_distance"]
+        )
+        combined_index["graph_score"] = combined_index["page_id"].map(
+            graph_by_page["graph_score"]
+        )
     combined_index["query_text_match"] = combined_index["query_text_match"].fillna(False).astype(bool)
     combined_index["entity_associated"] = (
         combined_index.get(
@@ -1048,6 +1128,28 @@ def search_local_history(
     ].copy()
     dense_candidates["distance_km"] = np.nan
     dense_candidates["source"] = "dense"
+    graph_candidates = features[
+        features["page_id"].isin(graph_index["page_id"])
+        & ~features["page_id"].isin(nearby_ids)
+        & features["lat"].isna()
+    ].copy()
+    if graph_index.empty:
+        graph_candidates["graph_distance"] = pd.Series(
+            dtype="float64", index=graph_candidates.index
+        )
+        graph_candidates["graph_score"] = pd.Series(
+            dtype="float64", index=graph_candidates.index
+        )
+    else:
+        graph_by_page = graph_index.set_index("page_id")
+        graph_candidates["graph_distance"] = graph_candidates["page_id"].map(
+            graph_by_page["graph_distance"]
+        )
+        graph_candidates["graph_score"] = graph_candidates["page_id"].map(
+            graph_by_page["graph_score"]
+        )
+    graph_candidates["distance_km"] = np.nan
+    graph_candidates["source"] = "graph"
     category_candidates = features[
         (features["category_score"] > 0)
         & ~features["page_id"].isin(nearby_ids)
@@ -1059,13 +1161,16 @@ def search_local_history(
         bm25_candidates,
         dense_candidates,
         category_candidates,
+        graph_candidates,
         k=RRF_K,
+        rrf_weights=(ranking_weights or {}).get("rrf"),
     )
     combined = combine_retrieval_results(
         coordinate_candidates,
         bm25_candidates,
         dense_candidates,
         category_candidates,
+        graph_candidates,
     )
     combined = combined.merge(
         rrf_scores[["page_id", "rrf_score"]],
@@ -1080,8 +1185,14 @@ def search_local_history(
         combined,
         radius_km,
         use_importance=use_importance,
+        score_weights=ranking_weights.get("score"),
     )
-    scored = rerank_with_cross_encoder(scored, location_name)
+    if rerank:
+        scored = rerank_with_cross_encoder(
+            scored,
+            location_name,
+            weight=ranking_weights.get("cross_encoder", RERANKER_WEIGHT),
+        )
     results, stats = finalize_results(scored, top_n)
     stats["population"] = population
     stats["importance_enabled"] = use_importance

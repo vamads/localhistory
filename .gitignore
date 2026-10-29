@@ -21,6 +21,7 @@ categories_by_hop.txt
 .env
 .env.*
 *.log
+notebooks/
 
 # Frontend build and TypeScript compiler artifacts
 web/node_modules/

@@ -198,6 +198,7 @@ async def search(
         bm25_min_score=1.0,
         dense_top_k=200,
         population=local_city.population if local_city is not None else None,
+        geoname_id=local_city.geoname_id if local_city is not None else None,
     )
     search_ms = (time.perf_counter() - search_started) * 1000
 

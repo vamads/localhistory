@@ -20,11 +20,11 @@ of a few large cities, two or three hops is generally a better tradeoff.
 from __future__ import annotations
 
 import argparse
-import gzip
 import os
 from pathlib import Path
 import re
 import sqlite3
+import subprocess
 
 import pandas as pd
 
@@ -72,11 +72,34 @@ def sql_title(value: bytes) -> str:
 
 
 def stream_inserts(path: Path, table: str):
+    """Yield lines belonging to INSERT statements in the MariaDB dump.
+
+    Wikimedia's dump format places ``INSERT INTO ... VALUES`` on one line and
+    the value tuples on one or more following lines, so checking only the
+    header line silently produces an empty graph.
+    """
     needle = f"INSERT INTO `{table}`".encode()
-    with gzip.open(path, "rb") as source:
-        for line in source:
+    inside_insert = False
+    # Some locally downloaded Wikimedia dumps contain valid gzip data followed
+    # by harmless trailing bytes. The system gzip decoder can recover the valid
+    # stream; Python's gzip module raises BadGzipFile at the trailing bytes.
+    process = subprocess.Popen(
+        ["gzip", "-cd", str(path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    assert process.stdout is not None
+    try:
+        for line in process.stdout:
             if line.startswith(needle):
+                inside_insert = True
+            if inside_insert:
                 yield line
+                if line.rstrip().endswith(b";"):
+                    inside_insert = False
+    finally:
+        process.stdout.close()
+        process.wait()
 
 
 def resolve_targets(target_ids: set[int]) -> dict[int, int]:

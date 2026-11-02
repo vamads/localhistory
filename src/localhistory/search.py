@@ -865,19 +865,24 @@ def retrieve_dense_candidates(
 
 @lru_cache(maxsize=256)
 def load_city_graph_candidates(geoname_id: int | None) -> pd.DataFrame:
-    """Load graph-associated article IDs for a city when available."""
+    """Load graph candidates by matching dump titles to runtime article titles."""
     columns = ["page_id", "graph_distance", "graph_score"]
     if geoname_id is None or not CITY_GRAPH_DATABASE_PATH.exists():
         return pd.DataFrame(columns=columns)
     with sqlite3.connect(
         f"file:{CITY_GRAPH_DATABASE_PATH}?mode=ro&immutable=1", uri=True
     ) as connection:
+        connection.execute(
+            "ATTACH DATABASE ? AS article_source", (str(SQLITE_SEARCH_PATH),)
+        )
         frame = pd.read_sql_query(
             """
-            SELECT article_page_id AS page_id, MIN(graph_distance) AS graph_distance
-            FROM city_article_graph
-            WHERE geoname_id = ?
-            GROUP BY article_page_id
+            SELECT a.page_id, MIN(g.graph_distance) AS graph_distance
+            FROM city_article_graph g
+            JOIN article_source.articles a
+              ON REPLACE(a.title, ' ', '_') = g.article_title
+            WHERE g.geoname_id = ?
+            GROUP BY a.page_id
             """,
             connection,
             params=[int(geoname_id)],

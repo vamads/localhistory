@@ -58,10 +58,13 @@ CREATE TABLE city_article_graph (
     article_page_id INTEGER NOT NULL,
     graph_distance INTEGER NOT NULL,
     parent_page_id INTEGER,
-    PRIMARY KEY (geoname_id, article_page_id)
+    seed_title TEXT NOT NULL,
+    article_title TEXT NOT NULL,
+    parent_title TEXT,
+    PRIMARY KEY (geoname_id, article_title)
 );
 CREATE INDEX city_article_graph_article_idx
-    ON city_article_graph(article_page_id);
+    ON city_article_graph(article_title);
 CREATE INDEX city_article_graph_city_idx
     ON city_article_graph(geoname_id, graph_distance);
 """
@@ -102,8 +105,8 @@ def stream_inserts(path: Path, table: str):
         process.wait()
 
 
-def resolve_targets(target_ids: set[int]) -> dict[int, int]:
-    """Resolve a small set of pagelink target IDs to article page IDs."""
+def resolve_targets(target_ids: set[int]) -> dict[int, tuple[int, str]]:
+    """Resolve target IDs to dump page IDs and stable article titles."""
     if not target_ids:
         return {}
 
@@ -130,7 +133,7 @@ def resolve_targets(target_ids: set[int]) -> dict[int, int]:
                 )
 
     return {
-        target_id: title_to_page[title]
+        target_id: (title_to_page[title], title)
         for target_id, title in target_titles.items()
         if title in title_to_page
     }
@@ -154,8 +157,11 @@ def build_graph(
         raise RuntimeError("No non-redirect city seeds matched the requested filter")
 
     seed_by_page: dict[int, list[int]] = {}
-    for row in frame[["geoname_id", "page_id"]].itertuples(index=False):
-        seed_by_page.setdefault(int(row.page_id), []).append(int(row.geoname_id))
+    seed_title_by_page: dict[int, str] = {}
+    for row in frame[["geoname_id", "page_id", "wikipedia_title"]].itertuples(index=False):
+        page_id = int(row.page_id)
+        seed_by_page.setdefault(page_id, []).append(int(row.geoname_id))
+        seed_title_by_page[page_id] = str(row.wikipedia_title)
 
     temporary = output.with_suffix(output.suffix + ".building")
     if temporary.exists():
@@ -167,12 +173,13 @@ def build_graph(
     connection.executescript(SCHEMA)
 
     seed_rows = [
-        (geoname_id, page_id, page_id, 0, None)
+        (geoname_id, page_id, page_id, 0, None,
+         seed_title_by_page[page_id], seed_title_by_page[page_id], None)
         for page_id, geoname_ids in seed_by_page.items()
         for geoname_id in geoname_ids
     ]
     connection.executemany(
-        "INSERT INTO city_article_graph VALUES (?, ?, ?, ?, ?)", seed_rows
+        "INSERT INTO city_article_graph VALUES (?, ?, ?, ?, ?, ?, ?, ?)", seed_rows
     )
 
     # Compact breadth-first frontier: page_id -> (city, seed). We never
@@ -181,6 +188,7 @@ def build_graph(
         page_id: {(geoname_id, page_id) for geoname_id in geoname_ids}
         for page_id, geoname_ids in seed_by_page.items()
     }
+    title_by_page = dict(seed_title_by_page)
     visited: set[tuple[int, int, int]] = {
         (geoname_id, page_id, page_id)
         for page_id, geoname_ids in seed_by_page.items()
@@ -206,23 +214,35 @@ def build_graph(
         next_frontier: dict[int, set[tuple[int, int]]] = {}
         graph_rows = []
         for source_page, target_id in edges:
-            article_page = target_to_page.get(target_id)
+            target = target_to_page.get(target_id)
+            article_page = target[0] if target else None
             if article_page is None or article_page == source_page:
                 continue
+            article_title = target[1]
+            title_by_page[article_page] = article_title
             for geoname_id, seed_page in frontier[source_page]:
                 visit = (geoname_id, seed_page, article_page)
                 if visit in visited:
                     continue
                 visited.add(visit)
                 graph_rows.append(
-                    (geoname_id, seed_page, article_page, distance, source_page)
+                    (
+                        geoname_id,
+                        seed_page,
+                        article_page,
+                        distance,
+                        source_page,
+                        seed_title_by_page[seed_page],
+                        article_title,
+                        title_by_page.get(source_page),
+                    )
                 )
                 next_frontier.setdefault(article_page, set()).add(
                     (geoname_id, seed_page)
                 )
 
         connection.executemany(
-            "INSERT OR IGNORE INTO city_article_graph VALUES (?, ?, ?, ?, ?)",
+            "INSERT OR IGNORE INTO city_article_graph VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             graph_rows,
         )
         connection.commit()
@@ -248,7 +268,7 @@ def main() -> None:
     parser.add_argument("--city", help="Canonical query to build, e.g. 'Paris, France'")
     parser.add_argument(
         "--max-hops", type=int, default=2,
-        help="Maximum link distance from each city article (default: 2)",
+        help="Maximum link distance from each city article (default: 1)",
     )
     args = parser.parse_args()
     for path in (args.matches, PAGE_DUMP, LINKTARGET_DUMP, PAGELINKS_DUMP):

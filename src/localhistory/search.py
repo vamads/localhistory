@@ -893,6 +893,17 @@ def load_city_graph_candidates(geoname_id: int | None) -> pd.DataFrame:
     return frame
 
 
+def restrict_to_city_graph(
+    frame: pd.DataFrame,
+    graph_candidates: pd.DataFrame,
+) -> pd.DataFrame:
+    """Keep only articles linked from the selected city article."""
+    if frame.empty or graph_candidates.empty:
+        return frame.iloc[0:0].copy()
+    page_ids = graph_candidates["page_id"].dropna().unique()
+    return frame[frame["page_id"].isin(page_ids)].copy()
+
+
 def combine_retrieval_results(*candidate_frames: pd.DataFrame) -> pd.DataFrame:
     """Combine branches, preferring coordinate evidence on overlap."""
     return pd.concat(candidate_frames).drop_duplicates(subset="page_id", keep="first")
@@ -1061,6 +1072,7 @@ def search_local_history(
     geoname_id: int | None = None,
     ranking_weights: dict | None = None,
     rerank: bool = True,
+    linked_only: bool = False,
 ) -> dict:
     """Search a city, using the importance prior only for larger cities.
 
@@ -1077,8 +1089,11 @@ def search_local_history(
             radius_km,
         )
 
-    dense_index = retrieve_dense_candidates(location_name, dense_top_k)
     graph_index = load_city_graph_candidates(geoname_id)
+    dense_index = retrieve_dense_candidates(location_name, dense_top_k)
+    if linked_only:
+        index = restrict_to_city_graph(index, graph_index)
+        dense_index = restrict_to_city_graph(dense_index, graph_index)
     graph_candidates = load_sqlite_page_candidates(
         graph_index["page_id"].astype(int).tolist()
     )
@@ -1201,4 +1216,6 @@ def search_local_history(
     results, stats = finalize_results(scored, top_n)
     stats["population"] = population
     stats["importance_enabled"] = use_importance
+    stats["linked_only"] = linked_only
+    stats["city_graph_candidates"] = len(graph_index)
     return {"results": results, "stats": stats}

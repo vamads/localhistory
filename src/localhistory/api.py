@@ -175,6 +175,7 @@ async def search(
     q: str = Query(min_length=2),
     radius_km: float = Query(default=50, gt=0, le=500),
     limit: int = Query(default=150, ge=10, le=500),
+    linked_only: bool = Query(default=False),
 ) -> SearchResponse:
     request_started = time.perf_counter()
     geocode_started = request_started
@@ -199,6 +200,7 @@ async def search(
         dense_top_k=200,
         population=local_city.population if local_city is not None else None,
         geoname_id=local_city.geoname_id if local_city is not None else None,
+        linked_only=linked_only,
     )
     search_ms = (time.perf_counter() - search_started) * 1000
 

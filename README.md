@@ -185,6 +185,18 @@ need to be deployed.
 The embedding `.npy` files remain separate because they are memory-mapped at
 query time. `runtime_manifest.json` records the production snapshot metadata.
 
+The API also supports graph-scoped search. Add `linked_only=true` to
+`/api/search` to restrict keyword, dense, category, and graph retrieval to
+articles linked from the resolved city article. For example:
+
+```text
+/api/search?q=Paris%2C%20France&linked_only=true
+```
+
+The default remains the broader search behavior. If the city has no built link
+graph, graph-scoped mode returns no articles rather than falling back to
+unlinked results.
+
 ## Profile search performance
 
 Run the profiler with fixed coordinates to measure cold-start and warm-search

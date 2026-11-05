@@ -267,10 +267,15 @@ def main() -> None:
     parser.add_argument("--output", type=Path, default=OUTPUT)
     parser.add_argument("--city", help="Canonical query to build, e.g. 'Paris, France'")
     parser.add_argument(
-        "--max-hops", type=int, default=2,
+        "--max-hops", type=int, default=1,
         help="Maximum link distance from each city article (default: 1)",
     )
     args = parser.parse_args()
+    if args.city is None and args.max_hops > 1:
+        parser.error(
+            "all-city builds are limited to one hop; pass --city for a "
+            "multi-hop exploration build"
+        )
     for path in (args.matches, PAGE_DUMP, LINKTARGET_DUMP, PAGELINKS_DUMP):
         if not path.exists():
             raise FileNotFoundError(path)

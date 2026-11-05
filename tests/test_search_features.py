@@ -1,6 +1,28 @@
 import pandas as pd
 
-from localhistory.search import article_quality_features, score_candidates
+from localhistory.search import (
+    article_quality_features,
+    restrict_to_city_graph,
+    score_candidates,
+)
+
+
+def test_restrict_to_city_graph_keeps_only_linked_articles():
+    candidates = pd.DataFrame({"page_id": [1, 2, 3], "title": ["A", "B", "C"]})
+    graph = pd.DataFrame({"page_id": [2, 3], "graph_distance": [1, 2]})
+
+    result = restrict_to_city_graph(candidates, graph)
+
+    assert result["page_id"].tolist() == [2, 3]
+
+
+def test_restrict_to_city_graph_is_empty_without_city_links():
+    candidates = pd.DataFrame({"page_id": [1, 2]})
+    graph = pd.DataFrame(columns=["page_id", "graph_distance"])
+
+    result = restrict_to_city_graph(candidates, graph)
+
+    assert result.empty
 
 
 def test_metadata_completeness_is_normalized_by_entity_type():

@@ -97,6 +97,7 @@ def run_search(args: argparse.Namespace, index: pd.DataFrame) -> dict:
         dense_top_k=200,
         index=index,
         population=resolved_city.population if resolved_city is not None else None,
+        country_name=resolved_city.country_name if resolved_city is not None else None,
     )
     sync_device()
     return {

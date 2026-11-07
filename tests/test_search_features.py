@@ -3,6 +3,7 @@ import pandas as pd
 from localhistory.search import (
     article_quality_features,
     restrict_to_city_graph,
+    restrict_to_country,
     score_candidates,
 )
 
@@ -23,6 +24,19 @@ def test_restrict_to_city_graph_is_empty_without_city_links():
     result = restrict_to_city_graph(candidates, graph)
 
     assert result.empty
+
+
+def test_restrict_to_country_keeps_matching_country_metadata():
+    candidates = pd.DataFrame(
+        {
+            "page_id": [1, 2, 3],
+            "country": ["France", "United States", '["France"]'],
+        }
+    )
+
+    result = restrict_to_country(candidates, "France")
+
+    assert result["page_id"].tolist() == [1, 3]
 
 
 def test_metadata_completeness_is_normalized_by_entity_type():

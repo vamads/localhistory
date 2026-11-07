@@ -193,9 +193,14 @@ articles linked from the resolved city article. For example:
 /api/search?q=Paris%2C%20France&linked_only=true
 ```
 
-The default remains the broader search behavior. If the city has no built link
-graph, graph-scoped mode returns no articles rather than falling back to
-unlinked results.
+`linked_only=true` is strict: if the city has no built link graph, it returns
+no articles rather than falling back to unlinked results.
+
+For normal city searches, the API now automatically uses the city-linked
+article set when at least 50 linked articles are available. Smaller graph
+results fall back to the existing retrieval pipeline scoped to the city's
+country. Override the threshold with `LOCAL_HISTORY_GRAPH_MIN_ARTICLES`.
+`linked_only=true` remains a strict graph-only override.
 
 ## Profile search performance
 

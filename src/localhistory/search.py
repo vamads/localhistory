@@ -56,6 +56,9 @@ RERANKER_WEIGHT = 5.0
 CITY_IMPORTANCE_POPULATION_THRESHOLD = int(
     os.getenv("LOCAL_HISTORY_IMPORTANCE_MIN_POPULATION", "200000")
 )
+CITY_GRAPH_MIN_ARTICLES = int(
+    os.getenv("LOCAL_HISTORY_GRAPH_MIN_ARTICLES", "50")
+)
 METADATA_COMPLETENESS_WEIGHT = float(
     os.getenv("LOCAL_HISTORY_METADATA_BOOST", "1.5")
 )
@@ -428,6 +431,25 @@ def load_sqlite_page_candidates(page_ids: list[int]) -> pd.DataFrame:
     database_uri = f"file:{SQLITE_SEARCH_PATH}?mode=ro&immutable=1"
     with sqlite3.connect(database_uri, uri=True) as connection:
         return pd.read_sql_query(query, connection, params=page_ids)
+
+
+@lru_cache(maxsize=128)
+def load_sqlite_country_page_ids(country_name: str) -> tuple[int, ...]:
+    """Return searchable article IDs whose metadata names this country."""
+    country = country_name.strip().casefold()
+    if not country:
+        return ()
+    query = """
+        SELECT page_id
+        FROM articles
+        WHERE NOT is_redirect
+          AND lower(trim(COALESCE(country, ''))) = ?
+        ORDER BY page_id
+    """
+    database_uri = f"file:{SQLITE_SEARCH_PATH}?mode=ro&immutable=1"
+    with sqlite3.connect(database_uri, uri=True) as connection:
+        rows = connection.execute(query, [country]).fetchall()
+    return tuple(int(page_id) for (page_id,) in rows)
 
 
 @lru_cache(maxsize=1)
@@ -851,9 +873,23 @@ def retrieve_bm25_candidates(
 def retrieve_dense_candidates(
     location_name: str,
     dense_top_k: int,
+    page_ids: tuple[int, ...] | None = None,
 ) -> pd.DataFrame:
-    """Retrieve top candidates from the FAISS dense index."""
-    ranking = dense_retrieve_page_ids(location_name, dense_top_k)
+    """Retrieve top candidates globally or within a supplied page-ID scope."""
+    if page_ids is None:
+        ranking = dense_retrieve_page_ids(location_name, dense_top_k)
+    else:
+        scores = dense_scores(location_name, page_ids)
+        if scores.empty:
+            ranking = pd.DataFrame(columns=["page_id", "dense_score"])
+        else:
+            ranking = (
+                scores.rename("dense_score")
+                .sort_values(ascending=False, kind="stable")
+                .head(dense_top_k)
+                .rename_axis("page_id")
+                .reset_index()
+            )
     candidates = load_sqlite_page_candidates(ranking["page_id"].astype(int).tolist())
     if candidates.empty:
         return candidates
@@ -902,6 +938,27 @@ def restrict_to_city_graph(
         return frame.iloc[0:0].copy()
     page_ids = graph_candidates["page_id"].dropna().unique()
     return frame[frame["page_id"].isin(page_ids)].copy()
+
+
+def restrict_to_country(
+    frame: pd.DataFrame,
+    country_name: str | None,
+) -> pd.DataFrame:
+    """Keep candidates whose structured country metadata matches the city."""
+    if frame.empty or not country_name or "country" not in frame:
+        return frame.copy()
+    country = str(country_name).strip().casefold()
+    values = frame["country"].fillna("").astype(str).str.casefold().str.strip()
+    # Metadata is normally a single label, but older rows may contain a
+    # serialized list or a semicolon/comma-separated label collection.
+    matches = (
+        values.eq(country)
+        | values.str.contains(
+            rf"(?:^|[\[\],;|])\s*['\"]?{re.escape(country)}['\"]?\s*(?:$|[\],;|])",
+            regex=True,
+        )
+    )
+    return frame[matches].copy()
 
 
 def combine_retrieval_results(*candidate_frames: pd.DataFrame) -> pd.DataFrame:
@@ -1069,6 +1126,7 @@ def search_local_history(
     dense_top_k: int = DEFAULT_DENSE_TOP_K,
     index: pd.DataFrame = None,
     population: int | None = None,
+    country_name: str | None = None,
     geoname_id: int | None = None,
     ranking_weights: dict | None = None,
     rerank: bool = True,
@@ -1090,10 +1148,23 @@ def search_local_history(
         )
 
     graph_index = load_city_graph_candidates(geoname_id)
-    dense_index = retrieve_dense_candidates(location_name, dense_top_k)
-    if linked_only:
+    graph_scope = linked_only or len(graph_index) >= CITY_GRAPH_MIN_ARTICLES
+    country_page_ids = (
+        load_sqlite_country_page_ids(country_name)
+        if not graph_scope and country_name
+        else None
+    )
+    dense_index = retrieve_dense_candidates(
+        location_name,
+        dense_top_k,
+        page_ids=country_page_ids,
+    )
+    if graph_scope:
         index = restrict_to_city_graph(index, graph_index)
         dense_index = restrict_to_city_graph(dense_index, graph_index)
+    else:
+        index = restrict_to_country(index, country_name)
+        dense_index = restrict_to_country(dense_index, country_name)
     graph_candidates = load_sqlite_page_candidates(
         graph_index["page_id"].astype(int).tolist()
     )
@@ -1101,6 +1172,8 @@ def search_local_history(
         graph_candidates = graph_candidates.merge(graph_index, on="page_id", how="inner")
         graph_candidates["distance_km"] = np.nan
         graph_candidates["source"] = "graph"
+        if not graph_scope:
+            graph_candidates = restrict_to_country(graph_candidates, country_name)
     dense_scores = (
         dense_index[["page_id", "dense_score"]]
         if not dense_index.empty
@@ -1218,4 +1291,7 @@ def search_local_history(
     stats["importance_enabled"] = use_importance
     stats["linked_only"] = linked_only
     stats["city_graph_candidates"] = len(graph_index)
+    stats["candidate_scope"] = "city_graph" if graph_scope else "country"
+    stats["country_name"] = country_name
+    stats["graph_scope_threshold"] = CITY_GRAPH_MIN_ARTICLES
     return {"results": results, "stats": stats}

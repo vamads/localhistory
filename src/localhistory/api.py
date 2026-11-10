@@ -1,6 +1,7 @@
 """HTTP API for the Local History web client."""
 
 from functools import lru_cache
+from contextlib import asynccontextmanager
 import logging
 import math
 import os
@@ -16,7 +17,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from .city_queries import resolve_city_query
-from .search import SQLITE_SEARCH_PATH, search_local_history
+from .search import (
+    SQLITE_SEARCH_PATH,
+    load_cross_encoder,
+    load_faiss_index,
+    search_local_history,
+)
 from .text import article_lead, clean_article_text
 
 
@@ -67,7 +73,27 @@ class MapPoint(BaseModel):
     longitude: float
 
 
-app = FastAPI(title="Local History API", version="0.1.0")
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """Load persistent retrieval resources before advertising readiness."""
+    startup_started = time.perf_counter()
+    load_faiss_index()
+    # Constructing CrossEncoder is not sufficient on all Torch versions:
+    # tokenizer/model kernels may be initialized on the first prediction.
+    # Run one tiny inference so the first user request sees warm-path latency.
+    load_cross_encoder().predict(
+        [("warmup query", "warmup article")],
+        batch_size=1,
+        show_progress_bar=False,
+    )
+    logger.info(
+        "Preloaded FAISS and cross-encoder in %.1f seconds",
+        time.perf_counter() - startup_started,
+    )
+    yield
+
+
+app = FastAPI(title="Local History API", version="0.1.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[os.getenv("LOCAL_HISTORY_WEB_ORIGIN", "http://localhost:5173")],

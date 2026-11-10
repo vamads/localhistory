@@ -41,7 +41,7 @@ def main() -> None:
     parser.add_argument("--radius", type=float, default=50.0)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--port", type=int, default=8010)
-    parser.add_argument("--startup-timeout", type=float, default=30.0)
+    parser.add_argument("--startup-timeout", type=float, default=120.0)
     args = parser.parse_args()
 
     base_url = f"http://127.0.0.1:{args.port}"

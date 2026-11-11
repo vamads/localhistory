@@ -17,6 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from .city_queries import resolve_city_query
+from .city_search_cache import load_cached_city_response
 from .search import (
     SQLITE_SEARCH_PATH,
     load_cross_encoder,
@@ -206,6 +207,16 @@ async def search(
     request_started = time.perf_counter()
     geocode_started = request_started
     local_city = resolve_city_query(q)
+    if local_city is not None:
+        cached_response = load_cached_city_response(
+            local_city.geoname_id,
+            radius_km,
+            limit,
+            linked_only,
+        )
+        if cached_response is not None:
+            response.headers["X-Search-Cache"] = "city"
+            return SearchResponse(**cached_response)
     try:
         location = await run_in_threadpool(geocode, q)
     except (requests.RequestException, ValueError) as exc:

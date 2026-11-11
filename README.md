@@ -75,6 +75,7 @@ kalm_embedding_page_ids.npy
 city_queries.sqlite
 city_query_embeddings.npy
 kalm_embeddings.faiss
+city_search_cache.sqlite
 ```
 
 `local_history_runtime.sqlite` is the consolidated read-only database created
@@ -90,6 +91,18 @@ article embeddings. Build it after step 7 to accelerate dense retrieval:
 ```bash
 python preprocessing/12_build_faiss_index.py
 ```
+
+The optional `city_search_cache.sqlite` stores precomputed default API
+responses for recognized cities. Build a resumable population-filtered cache
+with preprocessing step 15:
+
+```bash
+python preprocessing/15_build_city_search_cache.py --min-population 100000
+```
+
+The API uses cached responses for the default 50 km/150-result city request
+when available, and falls back to live retrieval for custom parameters or
+uncached cities. Use `--max-cities 5` for a small validation run first.
 
 SQLite FTS5/BM25 remains the lexical retrieval path, and the cross-encoder still reranks the
 top 50 text candidates. If the FAISS package or index is unavailable, runtime search falls back
@@ -125,6 +138,7 @@ python preprocessing/08_build_city_query_embeddings.py
 python preprocessing/09_build_citation_index.py
 python preprocessing/11_build_runtime_database.py
 python preprocessing/12_build_faiss_index.py
+python preprocessing/15_build_city_search_cache.py --min-population 100000
 ```
 
 ### Rebuilding from source data

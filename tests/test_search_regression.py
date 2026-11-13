@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import os
 import re
-from pathlib import Path
+import time
 
 import pytest
 
@@ -82,6 +82,8 @@ def test_key_city_searches_return_expected_articles():
     rerank = os.getenv("LOCAL_HISTORY_REGRESSION_RERANK", "1") != "0"
     failures = []
     for query, expected_titles in SEARCH_EXPECTATIONS.items():
+        started = time.perf_counter()
+        print(f"\n[{query}] starting search...", flush=True)
         city = resolve_city_query(query)
         assert city is not None, f"City is not recognized: {query}"
 
@@ -112,5 +114,12 @@ def test_key_city_searches_return_expected_articles():
                 f"{query}: missing {missing}; top results were "
                 f"{output['results']['title'].head(20).tolist()}"
             )
+        print(
+            f"[{query}] finished in {time.perf_counter() - started:.2f}s; "
+            f"scope={output['stats'].get('candidate_scope')}; "
+            f"graph_candidates={output['stats'].get('city_graph_candidates')}; "
+            f"missing={missing}",
+            flush=True,
+        )
 
     assert not failures, "\n".join(failures)

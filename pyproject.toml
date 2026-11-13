@@ -45,3 +45,8 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+markers = [
+    "search_regression: opt-in integration checks against local search data",
+]

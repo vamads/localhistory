@@ -20,18 +20,37 @@ import pytest
 from localhistory.city_queries import resolve_city_query
 from localhistory.search import DATA_DIR, search_local_history
 
-
 # Add or remove titles here as the desired search contract becomes clearer.
 SEARCH_EXPECTATIONS = {
     "Paris, France": [
         "Napoleon Bonaparte",
-        "Paris Commune (1789–1795)",
+        "Louis XVI",
+        "St. Bartholomew's Day massacre",
+        "Notre-Dame de Paris",
+        "Clovis I",
     ],
     "Ann Arbor, Michigan": [
         "University of Michigan",
+        "Huron River",
+        "Anishinaabe",
+        "Treaty of Detroit",
+        "John Allen (pioneer)",
     ],
     "Detroit, Michigan": [
         "Ford Motor Company",
+        "Antoine de la Mothe Cadillac",
+        "Detroit bankruptcy",
+        "Motown",
+        "Detroit River",
+        "Great Fire of 1805",
+    ],
+    "A Coruña, Spain": [
+        "Ferdinand II of León",
+        "Tower of Hercules",
+        "Brigantes",
+        "Galicia (Spain)",
+        "Battle of Corunna",
+        "María Pita",
     ],
 }
 
@@ -80,8 +99,7 @@ def test_key_city_searches_return_expected_articles():
             rerank=rerank,
         )
         titles = [
-            normalize_title(str(title))
-            for title in output["results"]["title"].tolist()
+            normalize_title(str(title)) for title in output["results"]["title"].tolist()
         ]
         title_set = set(titles)
         missing = [

@@ -142,7 +142,6 @@ def load_candidate_index(
         "query_text_match",
         "exact_title_match",
         "lead_exact_match",
-        "exact_full_text_match",
         "entity_associated",
     ):
         values = candidates.get(
@@ -220,7 +219,6 @@ def load_sqlite_text_candidates(location_name: str) -> pd.DataFrame:
         for fts_column, result_column in (
             ("title", "exact_title_match"),
             ("first_paragraph", "lead_exact_match"),
-            ("full_text", "exact_full_text_match"),
         ):
             matches = connection.execute(
                 "SELECT rowid FROM article_fts WHERE article_fts MATCH ?",
@@ -250,8 +248,7 @@ def load_sqlite_entity_candidates(location_name: str) -> pd.DataFrame:
             1 AS entity_associated,
             1 AS query_match_tier,
             0 AS exact_title_match,
-            0 AS lead_exact_match,
-            0 AS exact_full_text_match
+            0 AS lead_exact_match
         FROM articles
         WHERE NOT articles.is_redirect
           AND (
@@ -269,8 +266,7 @@ def load_sqlite_entity_candidates(location_name: str) -> pd.DataFrame:
             1 AS entity_associated,
             1 AS query_match_tier,
             0 AS exact_title_match,
-            0 AS lead_exact_match,
-            0 AS exact_full_text_match
+            0 AS lead_exact_match
         FROM articles
         JOIN article_categories
           ON article_categories.page_id = articles.page_id
@@ -400,8 +396,7 @@ def load_sqlite_coordinate_candidates(
             {ARTICLE_COLUMNS},
             0.0 AS bm25_score,
             0 AS exact_title_match,
-            0 AS lead_exact_match,
-            0 AS exact_full_text_match
+            0 AS lead_exact_match
         FROM articles
         WHERE NOT articles.is_redirect
           AND articles.lat BETWEEN ? AND ?
@@ -422,8 +417,7 @@ def load_sqlite_page_candidates(page_ids: list[int]) -> pd.DataFrame:
             {ARTICLE_COLUMNS},
             0.0 AS bm25_score,
             0 AS exact_title_match,
-            0 AS lead_exact_match,
-            0 AS exact_full_text_match
+            0 AS lead_exact_match
         FROM articles
         WHERE NOT articles.is_redirect
           AND articles.page_id IN ({placeholders})
@@ -795,37 +789,32 @@ def article_quality_features(frame: pd.DataFrame) -> pd.DataFrame:
 def prepare_search_features(
     frame: pd.DataFrame,
     location_name: str,
+    dense_score_by_page: pd.Series | None = None,
 ) -> tuple[pd.DataFrame, pd.Series]:
-    """Add quality and normalized BM25/dense score features."""
+    """Add quality and dense score features."""
     for column in (
         "is_list_article",
         "query_text_match",
         "exact_title_match",
         "lead_exact_match",
-        "exact_full_text_match",
     ):
         frame[column] = frame[column].fillna(False).astype(bool)
     frame = article_quality_features(frame.copy())
     frame["bm25_score"] = pd.to_numeric(frame["bm25_score"], errors="coerce").fillna(0.0)
     text_match = frame["query_text_match"]
-    frame["kalm_score"] = frame["page_id"].map(
-        dense_scores(location_name, tuple(frame.loc[text_match, "page_id"].tolist()))
-    ).fillna(0.0)
+    if dense_score_by_page is None:
+        dense_score_by_page = pd.Series(dtype="float32")
+    missing_page_ids = tuple(
+        page_id
+        for page_id in frame.loc[text_match, "page_id"].tolist()
+        if page_id not in dense_score_by_page.index
+    )
+    if missing_page_ids:
+        missing_scores = dense_scores(location_name, missing_page_ids)
+        dense_score_by_page = pd.concat([dense_score_by_page, missing_scores])
+    frame["dense_score"] = frame["page_id"].map(dense_score_by_page)
     frame["dense_score"] = pd.to_numeric(
         frame.get("dense_score", np.nan), errors="coerce"
-    )
-    frame["bm25_score_normalized"] = 0.0
-    frame["kalm_score_normalized"] = 0.0
-    frame["dense_score_normalized"] = 0.0
-    frame.loc[text_match, "bm25_score_normalized"] = normalize_scores(
-        frame.loc[text_match, "bm25_score"]
-    )
-    frame.loc[text_match, "kalm_score_normalized"] = normalize_scores(
-        frame.loc[text_match, "kalm_score"]
-    )
-    dense_match = frame["dense_score"].notna()
-    frame.loc[dense_match, "dense_score_normalized"] = normalize_scores(
-        frame.loc[dense_match, "dense_score"]
     )
     return frame, text_match
 
@@ -1165,6 +1154,9 @@ def search_local_history(
     else:
         index = restrict_to_country(index, country_name)
         dense_index = restrict_to_country(dense_index, country_name)
+    graph_by_page = (
+        graph_index.set_index("page_id") if not graph_index.empty else None
+    )
     graph_candidates = load_sqlite_page_candidates(
         graph_index["page_id"].astype(int).tolist()
     )
@@ -1174,19 +1166,19 @@ def search_local_history(
         graph_candidates["source"] = "graph"
         if not graph_scope:
             graph_candidates = restrict_to_country(graph_candidates, country_name)
-    dense_scores = (
+    dense_score_by_page = (
         dense_index[["page_id", "dense_score"]]
         if not dense_index.empty
         else pd.DataFrame(columns=["page_id", "dense_score"])
     )
+    dense_score_by_page = dense_score_by_page.set_index("page_id")["dense_score"]
     combined_index = pd.concat(
         [index, dense_index, graph_candidates],
         ignore_index=True,
     ).drop_duplicates(
         subset="page_id", keep="first"
     )
-    if not graph_index.empty:
-        graph_by_page = graph_index.set_index("page_id")
+    if graph_by_page is not None:
         combined_index["graph_distance"] = combined_index["page_id"].map(
             graph_by_page["graph_distance"]
         )
@@ -1203,10 +1195,12 @@ def search_local_history(
         .astype(bool)
     )
     combined_index = combined_index.drop(columns=["source", "distance_km"], errors="ignore")
-    combined_index = combined_index.drop(columns=["dense_score"], errors="ignore").merge(
-        dense_scores, on="page_id", how="left"
+    combined_index = combined_index.drop(columns=["dense_score"], errors="ignore")
+    features, text_match = prepare_search_features(
+        combined_index,
+        location_name,
+        dense_score_by_page=dense_score_by_page,
     )
-    features, text_match = prepare_search_features(combined_index, location_name)
     coordinate_candidates = retrieve_coordinate_candidates(
         features, user_lat, user_lon, radius_km
     )
@@ -1226,7 +1220,7 @@ def search_local_history(
         & ~features["page_id"].isin(nearby_ids)
         & features["lat"].isna()
     ].copy()
-    if graph_index.empty:
+    if graph_by_page is None:
         graph_candidates["graph_distance"] = pd.Series(
             dtype="float64", index=graph_candidates.index
         )
@@ -1234,7 +1228,6 @@ def search_local_history(
             dtype="float64", index=graph_candidates.index
         )
     else:
-        graph_by_page = graph_index.set_index("page_id")
         graph_candidates["graph_distance"] = graph_candidates["page_id"].map(
             graph_by_page["graph_distance"]
         )
